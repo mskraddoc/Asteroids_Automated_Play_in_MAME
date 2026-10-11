@@ -1,0 +1,22 @@
+# MAME build and ROMs (ROMs are copyrighted; not distributed)
+mame/
+roms/
+macports_user_dir/
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store
+
+# Session logs and console history
+*.txt
+console_history
+
+# 2024 prototypes (kept locally, not tracked)
+client.py
+server.py
+pyserv.py
+pyserveraw
+pyserveraw.py
+luaclient.lua
+mameclient.lua
