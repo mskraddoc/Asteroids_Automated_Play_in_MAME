@@ -2,11 +2,11 @@
 
 Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 A Lua script running in MAME sends game data to a Python server once per
-emulated frame and waits for a reply. The emulator and the Python server stay in
+emulated gameplay frame and waits for a reply. The emulator and the Python server stay in
 lock-step. The server decodes the game's object table, tracks rocks, saucers and
 bullets between frames to estimate their velocities, and decides which controls
-to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim at the
-highest-priority target (saucers, then small, medium and large rocks) and fires.
+to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the
+highest-priority target (saucers, then small, medium and large rocks) and fire.
 The server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
 
 ## Tested with
@@ -30,27 +30,28 @@ shells. Let me know how it goes.
 ## Requirements
 
 - Python 3 with `numpy` (`pip3 install numpy`)
-- A MAME build (0.270 tested), in `mame/` next to these files
-- Your own Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`.
+- A MAME build (tested with ver 0.270)
+- Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`.  You will have to find your own rom file.
   **The ROMs are not included.**
 
 ## Run
 
-In one terminal, start the server first:
+In a terminal window, start the Python server first:
 
 ```zsh
 python3 ast_server.py
 ```
 
-In a second terminal, start MAME from `mame/`:
+In a second terminal, start MAME using:
 
 ```zsh
-cd mame
-./mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
+mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
 ```
 
-The autopilot inserts a coin, starts the game, and restarts it after a game
-over. If the server doesn't reply within 2 seconds, MAME stops waiting for it.
+Make sure to edit "-rompath ../roms" to match your configuration.
+
+The Python autopilot script inserts a coin, starts the game, and restarts it after a game
+ends. If the Python server doesn't reply within 2 seconds, MAME stops waiting for it.
 
 ## Keys (in MAME)
 
