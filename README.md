@@ -30,8 +30,8 @@ shells. Let me know how it goes.
 ## Requirements
 
 - Python 3 with `numpy` (`pip3 install numpy`)
-- A MAME build (tested with ver 0.270)
-- Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`.  You will have to find your own rom file.
+- A MAME build (tested with version 0.270)
+- Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`. You will have to find your own ROM set.
   **The ROMs are not included.**
 
 ## Run
@@ -48,7 +48,7 @@ In a second terminal, start MAME using:
 mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
 ```
 
-Make sure to edit "-rompath ../roms" to match your configuration.
+Make sure to edit `-rompath ../roms` to match your configuration.
 
 The Python autopilot script inserts a coin, starts the game, and restarts it after a game
 ends. If the Python server doesn't reply within 2 seconds, MAME stops waiting for it.
