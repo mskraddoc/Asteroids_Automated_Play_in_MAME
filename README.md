@@ -1,13 +1,9 @@
 # Asteroids Automated Play in MAME
 
-Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
-A Lua script running in MAME sends game data to a Python server once per
-emulated gameplay frame and waits for a reply. The emulator and the Python server stay in
-lock-step. The server decodes the game's object table, tracks rocks, saucers and
-bullets between frames to estimate their velocities, and decides which controls
+This project contains Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
+A Lua script running in MAME sends game data to a Python server. The server decodes the game's object table and decides which controls
 to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the
-highest-priority target (saucers, then small, medium and large rocks) and fire.
-The server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
+highest-priority target and fire. The server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
 
 ## Tested with
 
@@ -16,7 +12,7 @@ The server sends MAME keypresses back to the MAME Lua script to control gameplay
 - **macOS 26.5.2** (Intel x86_64), **zsh 5.9** shell
 
 It seems likely to work with other MAME versions, Asteroids ROM revisions, operating systems, and/or
-shells. Let me know how it goes.
+shells. Let me know how it goes. I struggled to find working examples of MAME Lua<>Python socket communication.  The approach here works well and you are welcome to extend it as you like.  I used Claude Code to help me clear the way.
 
 ## Files
 
