@@ -1,13 +1,13 @@
 # Asteroids Automated Play in MAME
 
-LUA and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
+Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 A Lua script running in MAME sends game data to a Python server once per
-emulated frame and waits for a reply. The emulator and the python server stay in
+emulated frame and waits for a reply. The emulator and the Python server stay in
 lock-step. The server decodes the game's object table, tracks rocks, saucers and
 bullets between frames to estimate their velocities, and decides which controls
 to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim at the
 highest-priority target (saucers, then small, medium and large rocks) and fires.
-The server sends MAME keypresses presses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
+The server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
 
 ## Tested with
 
@@ -15,7 +15,7 @@ The server sends MAME keypresses presses back to the MAME Lua script to control 
 - **Asteroids (rev 4)**, MAME set `asteroid`
 - **macOS 26.5.2** (Intel x86_64), **zsh 5.9** shell
 
-It seems liekly to work with other MAME versions, Asteroids ROM revisions, operating systems, and/or
+It seems likely to work with other MAME versions, Asteroids ROM revisions, operating systems, and/or
 shells. Let me know how it goes.
 
 ## Files
@@ -26,7 +26,6 @@ shells. Let me know how it goes.
 | `ast_server.py` | Python server. Handles local socket communication, decodes and tracks objects, and calls the autopilot |
 | `ast_ai.py`     | The autopilot: threat check, evasion, target choice and aiming                                         |
 | `cfg/`          | MAME configuration for `asteroid`                                                                      |
-
 
 ## Requirements
 
