@@ -3,7 +3,7 @@
 This project contains Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 A Lua script running in MAME sends game data to a Python server. The server decodes the game's object table and decides which controls
 to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the
-highest-priority target and fire. The server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
+highest-priority target and fire. The Python server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
 
 ## Tested with
 
@@ -28,7 +28,7 @@ shells. Let me know how it goes. I struggled to find working examples of MAME Lu
 - Python 3 with `numpy` (`pip3 install numpy`)
 - A MAME build (tested with version 0.270)
 - Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`. You will have to find your own ROM set.
-  **The ROMs are not included.**
+  **The ROMs are not included here.**
 
 ## Run
 
