@@ -68,4 +68,6 @@ ends. If the Python server doesn't reply within 2 seconds, MAME stops waiting fo
 
 ## Video
 
+<a href="https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4"><img width="50%" alt="One Hour of Automated Gameplay: autopilot in EVADE mode at 57,280 points" src="images/gameplay-video.png"></a>
+
 [One Hour of Automated Gameplay](https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4)
