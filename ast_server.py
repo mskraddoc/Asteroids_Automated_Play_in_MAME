@@ -4,19 +4,28 @@
 # page 0x00-0xFF, then object page 0x200-0x2FF), decodes the game's object table,
 # tracks objects between frames to estimate velocity, lets the autopilot
 # (ast_ai.Pilot) choose inputs, and replies
-# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode>\n".
+# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode> G,score,ships,level\n".
 #   inputs: letters L R T F H (left right thrust fire hyperspace), C S (coin,
 #           start), or "-"
 #   px,py:  position projected projN frames ahead, only when projN > 0
 #   A,x,y:  the autopilot's aim point
+#   G,score,ships,level: total score (no rollover at 99,990), ships left, wave number
+#   SEED,lo,hi: sent once at each game start; Lua writes it into the game's
+#           random-number generator (zero page 0x5F/0x60)
 #
-# Start this first:  python3 ast_server.py
+# Start this first:  python3 ast_server.py [--random on|off|<seed>]
+#   on (default): pick a fresh seed from the clock and OS entropy, printed so
+#                 the session can be replayed; off: never touch the game's RNG.
 
+import argparse
+import hashlib
+import os
+import random
 import socket
 import time
 from collections import Counter, deque
 
-from ast_ai import Pilot
+from ast_ai import Pilot, bcd
 
 HOST, PORT = "127.0.0.1", 9999
 STATUS_EVERY = 60  # log a status line every N frames
@@ -29,6 +38,7 @@ SAUCER_BULLET_SLOTS = range(29, 31)
 PLAYER_BULLET_SLOTS = range(31, 35)
 X_HI, Y_HI, X_LO, Y_LO = 0x69, 0x8C, 0xAF, 0xD2
 VX, VY = 0x23, 0x46  # signed velocity bytes, units/frame
+RNG_LO, RNG_HI = 0x5F, 0x60  # the game's 16-bit random-number generator (never 0)
 ROCK_SIZE = {4: "L", 2: "M", 0: "S"}
 SAUCER_SIZE = {2: "U", 1: "u"}
 
@@ -178,6 +188,47 @@ class Tracker:
         return e
 
 
+class Scorekeeper:
+    """Game total score (without the arcade's rollover), ships left and level.
+
+    The level counts waves: rocks reach zero between waves, so each change from
+    no rocks to some rocks during a game is a new wave. At game start the attract
+    rocks are cleared before the first wave appears.
+    """
+
+    MAX_SCORE = 9_999_999_999
+
+    def __init__(self):
+        self.total = 0
+        self.ships = 0
+        self.level = 0
+        self.prev_score = 0
+        self.had_rocks = True
+        self.started = False  # True on the frame a game starts
+
+    def update(self, zp, objs):
+        score = (bcd(zp[0x53]) * 100 + bcd(zp[0x52])) * 10
+        ships = zp[0x57]
+        rocks = any(o[0] in ROCK_SLOTS for o in objs)
+        self.started = bool(ships and not self.ships)
+        if self.started:
+            self.total = self.level = 0
+            self.prev_score = score
+        if ships or self.ships:
+            # The arcade score wraps at 100,000; a large "drop" is a reset, not points.
+            delta = (score - self.prev_score) % 100_000
+            if delta < 50_000:
+                self.total = min(self.total + delta, self.MAX_SCORE)
+            if rocks and not self.had_rocks:
+                self.level += 1
+        self.prev_score = score
+        self.ships = ships
+        self.had_rocks = rocks
+
+    def token(self):
+        return f"G,{self.total},{self.ships},{self.level}"
+
+
 def summary(n, tracker, proj_n, pilot, mode):
     tracks = tracker.tracks.values()
     counts = Counter(t.kind for t in tracks)
@@ -196,10 +247,14 @@ def summary(n, tracker, proj_n, pilot, mode):
     return s
 
 
-def serve(conn):
+def serve(conn, seed):
+    """seed: None to leave the game's RNG alone, else seeds each game's RNG value."""
+    rng = random.Random(seed) if seed is not None else None
+    games = 0
     rx = conn.makefile("rb")
     tracker = Tracker()
     pilot = Pilot()
+    keeper = Scorekeeper()
     t0 = time.time()
     while True:
         line = rx.readline()
@@ -217,6 +272,7 @@ def serve(conn):
         zp, page = ram[:256], ram[256:]
         objs = decode_objects(page)
         tracker.update(n, objs)
+        keeper.update(zp, objs)
         ship_vel = (signed(page[VX + SHIP_SLOT]), signed(page[VY + SHIP_SLOT]))
         inputs, overlay, mode = pilot.step(n, tracker, SHIP_SLOT, zp, ship_vel)
         proj = tracker.predict(n, proj_n) if proj_n > 0 else {}
@@ -227,15 +283,57 @@ def serve(conn):
             else:
                 tokens.append(f"{kind},{slot},{x},{y}")
         tokens += overlay
+        tokens.append(keeper.token())
+        if keeper.started:
+            games += 1
+            if rng:
+                game_seed = rng.randrange(1, 0x10000)
+                tokens.append(f"SEED,{game_seed & 0xFF},{game_seed >> 8}")
+            else:
+                game_seed = zp[RNG_HI] << 8 | zp[RNG_LO]
+            print(f"game {games} start: RNG 0x{game_seed:04X}" + ("" if rng else " (game's own)"))
         conn.sendall(f"ACK {n} {inputs} {' '.join(tokens)}\n".encode())
 
         if n % STATUS_EVERY == 0:
             t1 = time.time()
-            print(f"{summary(n, tracker, proj_n, pilot, mode)}  {STATUS_EVERY / (t1 - t0):.1f} fps")
+            print(f"{summary(n, tracker, proj_n, pilot, mode)} total={keeper.total} level={keeper.level}"
+                  f"  {STATUS_EVERY / (t1 - t0):.1f} fps")
             t0 = t1
 
 
+def clock_seed():
+    """A seed mixing the clocks, the process id and OS entropy."""
+    h = hashlib.sha256()
+    for v in (time.time_ns(), time.perf_counter_ns(), time.monotonic_ns(), os.getpid()):
+        h.update(v.to_bytes(16, "little"))
+    h.update(os.urandom(16))
+    return int.from_bytes(h.digest()[:6], "little")  # 48 bits: short enough to retype
+
+
+def parse_random(arg):
+    """--random value -> seed int, or None for off."""
+    if arg == "off":
+        return None
+    if arg == "on":
+        return clock_seed()
+    try:
+        seed = int(arg, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected on, off or a seed number")
+    if seed < 0:
+        raise argparse.ArgumentTypeError("seed must be >= 0")
+    return seed
+
+
 def main():
+    ap = argparse.ArgumentParser(description="Asteroids autopilot server for ast_link.lua")
+    ap.add_argument("--random", default="on", type=parse_random, metavar="on|off|SEED",
+                    help="randomize each game's starting RNG (default on); a number replays a session")
+    seed = ap.parse_args().random
+    if seed is None:
+        print("random: off (the game's RNG runs as the ROM leaves it)")
+    else:
+        print(f"random: seed {seed} (replay with --random {seed})")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
@@ -245,7 +343,7 @@ def main():
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print(f"MAME connected from {addr}")
         with conn:
-            serve(conn)
+            serve(conn, seed)
         print("MAME disconnected")
 
 

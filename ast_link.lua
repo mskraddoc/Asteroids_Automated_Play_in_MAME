@@ -7,11 +7,15 @@
 -- or "-". Each <obj> is "K,slot,x,y" or, while projection is on,
 -- "K,slot,x,y,px,py" where px,py is the position Python projects projN frames
 -- ahead; slot is the object's RAM slot (0-34). "A,x,y" is the
--- autopilot's aim point and "MODE:<text>" its current mode.
+-- autopilot's aim point, "MODE:<text>" its current mode and "G,score,ships,level"
+-- the game totals for the score overlay. "SEED,lo,hi" (sent at game start) is
+-- written into the game's random-number generator at zero page 0x5F/0x60.
 --
 -- Keys: V toggles the projection display, ] / [ increase / decrease projN,
 -- I toggles the autopilot (off = you play), B toggles the object boxes and aim
--- line, O toggles the object list.
+-- line, O toggles the object list, A toggles the AI state text, S toggles the
+-- score overlay, . / , speed emulation up / down (0.25x-8x, then MAX =
+-- unthrottled, which shows the measured speed), = / - raise / lower volume.
 --
 -- Run (from mame/):
 --   ./mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
@@ -25,12 +29,23 @@ local KEY_TOGGLE, KEY_INC, KEY_DEC = "KEYCODE_V", "KEYCODE_CLOSEBRACE", "KEYCODE
 local KEY_AI = "KEYCODE_I"
 local KEY_BOXES = "KEYCODE_B"
 local KEY_LIST = "KEYCODE_O"
+local KEY_AI_TEXT = "KEYCODE_A"
+local KEY_SCORE = "KEYCODE_S"
+local KEY_FASTER, KEY_SLOWER = "KEYCODE_STOP", "KEYCODE_COMMA"
+local KEY_VOL_UP, KEY_VOL_DOWN = "KEYCODE_EQUALS", "KEYCODE_MINUS"
 local PROJ_STEP, PROJ_MIN, PROJ_MAX = 5, 5, 300
 local proj_on = false
 local proj_n = 30
 local ai_on = true
 local boxes_on = true
 local list_on = false
+local ai_text_on = true
+local score_on = true
+local SPEEDS = { 0.25, 0.5, 1, 2, 4, 8, "MAX" }  -- speed multipliers; MAX = unthrottled
+local speed_i = 3                          -- 1x, normal speed
+local VOL_STEP, VOL_MIN, VOL_MAX = 2, -32, 0  -- MAME attenuation, dB
+local NOTICE_SECS = 3                      -- how long the speed / volume notice shows
+local MEASURE_SECS = 0.5                   -- real-time window for the measured speed
 local LIST_SCALE = 1.5   -- small-font size: visible-area pixels per glyph grid unit
 -- Object overlay: half-width of box in game units (x 0-8191, y 0-6143), color, label
 local STYLE = {
@@ -62,6 +77,12 @@ local keys = {
 	ai = input:code_from_token(KEY_AI),
 	boxes = input:code_from_token(KEY_BOXES),
 	list = input:code_from_token(KEY_LIST),
+	ai_text = input:code_from_token(KEY_AI_TEXT),
+	score = input:code_from_token(KEY_SCORE),
+	faster = input:code_from_token(KEY_FASTER),
+	slower = input:code_from_token(KEY_SLOWER),
+	vol_up = input:code_from_token(KEY_VOL_UP),
+	vol_down = input:code_from_token(KEY_VOL_DOWN),
 }
 
 -- Input letter from Python -> port field
@@ -100,6 +121,69 @@ local frame = 0
 local linked = true
 local latest_objects = {}
 local ai_mode = ""
+local game_stats    -- latest "G" token: { "G", score, ships, level }
+local notice, notice_until = nil, 0  -- speed / volume message (string or function) and expiry
+local measured_speed                 -- emulated seconds per real second, last window
+local t_wall0, t_emu0                -- start of the current measuring window
+
+-- Wall-clock seconds; frame counts would stretch or shrink with the speed setting.
+local function now()
+	return emu.osd_ticks() / emu.osd_ticks_per_second()
+end
+
+local function show_notice(text)
+	notice, notice_until = text, now() + NOTICE_SECS
+end
+
+local function fmt_speed(x)
+	return (x == math.floor(x) and string.format("%d", x) or tostring(x)) .. "X"
+end
+
+-- Called every frame: emulated time over real time, averaged per MEASURE_SECS window.
+local function measure_speed()
+	local wall, emu_t = now(), machine.time:as_double()
+	if not t_wall0 then
+		t_wall0, t_emu0 = wall, emu_t
+	elseif wall - t_wall0 >= MEASURE_SECS then
+		measured_speed = (emu_t - t_emu0) / (wall - t_wall0)
+		t_wall0, t_emu0 = wall, emu_t
+	end
+end
+
+local function max_speed_notice()
+	if measured_speed then
+		return string.format("SPEED MAX  (measured %.1fX)", measured_speed)
+	end
+	return "SPEED MAX  (measuring...)"
+end
+
+local function set_speed(i)
+	i = math.max(1, math.min(i, #SPEEDS))
+	if i ~= speed_i then
+		t_wall0, measured_speed = nil, nil  -- start measuring the new setting afresh
+	end
+	speed_i = i
+	local speed = SPEEDS[speed_i]
+	if speed == "MAX" then
+		machine.video.throttled = false
+		show_notice(max_speed_notice)
+	else
+		machine.video.throttled = true
+		machine.video.throttle_rate = speed
+		local s = "SPEED " .. fmt_speed(speed)
+			.. "  (" .. fmt_speed(SPEEDS[1]) .. " - " .. fmt_speed(SPEEDS[#SPEEDS - 1]) .. ", MAX)"
+		if speed_i == 1 then
+			s = s .. "  MIN"
+		end
+		show_notice(s)
+	end
+end
+
+local function change_volume(step)
+	local sound = machine.sound
+	sound.attenuation = math.max(VOL_MIN, math.min(sound.attenuation + step, VOL_MAX))
+	show_notice("VOL " .. sound.attenuation .. " dB")
+end
 
 -- Read one '\n'-terminated line. socket:read never blocks, so poll until a line
 -- is complete or the timeout expires. Returns the line (without '\n') or nil.
@@ -146,6 +230,24 @@ local function poll_keys()
 	if key_pressed("list") then
 		list_on = not list_on
 	end
+	if key_pressed("ai_text") then
+		ai_text_on = not ai_text_on
+	end
+	if key_pressed("score") then
+		score_on = not score_on
+	end
+	if key_pressed("faster") then
+		set_speed(speed_i + 1)
+	end
+	if key_pressed("slower") then
+		set_speed(speed_i - 1)
+	end
+	if key_pressed("vol_up") then
+		change_volume(VOL_STEP)
+	end
+	if key_pressed("vol_down") then
+		change_volume(-VOL_STEP)
+	end
 	if key_pressed("ai") then
 		ai_on = not ai_on
 		if not ai_on then
@@ -173,6 +275,7 @@ local function on_frame()
 	end
 	frame = frame + 1
 	poll_keys()
+	measure_speed()
 
 	local ram = progspace:read_range(0x00, 0xff, 8) .. progspace:read_range(0x200, 0x2ff, 8)
 	local n_ahead = proj_on and proj_n or 0
@@ -196,6 +299,12 @@ local function on_frame()
 		apply_inputs(inputs)
 	end
 	latest_objects = parse_objects(rest)
+	for _, o in ipairs(latest_objects) do
+		if o[1] == "SEED" then
+			progspace:write_u8(0x5f, o[2])
+			progspace:write_u8(0x60, o[3])
+		end
+	end
 
 	if frame % STATUS_EVERY == 0 then
 		print("[ast_link] frame " .. frame .. " acked, " .. #latest_objects .. " objects")
@@ -268,6 +377,13 @@ local function draw_object_list(objs)
 	end
 end
 
+-- 1234567 -> "1,234,567"
+local function commas(n)
+	local s = tostring(math.floor(n))
+	s = s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+	return s
+end
+
 local function draw_overlay()
 	local ship, aim
 	local listed = {}
@@ -278,6 +394,8 @@ local function draw_overlay()
 			ship = o
 		elseif kind == "A" then
 			aim = o
+		elseif kind == "G" then
+			game_stats = o
 		elseif kind:sub(1, 5) == "MODE:" then
 			ai_mode = kind:sub(6)
 		end
@@ -312,7 +430,17 @@ local function draw_overlay()
 	if proj_on then
 		screen:draw_text(4, 4, "PROJ +" .. proj_n .. " frames", 0xffffff00, 0x00000000)
 	end
-	screen:draw_text(4, 30, ai_on and ("AI " .. ai_mode) or "AI OFF", 0xffffff00, 0x00000000)
+	if ai_text_on then
+		screen:draw_text(4, 30, ai_on and ("AI " .. ai_mode) or "AI OFF", 0xffffff00, 0x00000000)
+	end
+	if score_on and game_stats then
+		screen:draw_text("right", 4, string.format("SCORE %s\nSHIPS %d\nLEVEL %d",
+			commas(game_stats[2]), game_stats[3], game_stats[4]), 0xffffff00, 0x00000000)
+	end
+	if notice and now() < notice_until then
+		local text = type(notice) == "function" and notice() or notice
+		screen:draw_text("center", screen.height / 4, text, 0xffffff00, 0x00000000)
+	end
 	if list_on then
 		draw_object_list(listed)
 	end
