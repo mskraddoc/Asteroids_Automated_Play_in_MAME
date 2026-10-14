@@ -4,12 +4,13 @@
 # page 0x00-0xFF, then object page 0x200-0x2FF), decodes the game's object table,
 # tracks objects between frames to estimate velocity, lets the autopilot
 # (ast_ai.Pilot) choose inputs, and replies
-# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode> G,score,ships,level\n".
+# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode> G,score,ships,level,deaths\n".
 #   inputs: letters L R T F H (left right thrust fire hyperspace), C S (coin,
 #           start), or "-"
 #   px,py:  position projected projN frames ahead, only when projN > 0
 #   A,x,y:  the autopilot's aim point
-#   G,score,ships,level: total score (no rollover at 99,990), ships left, wave number
+#   G,score,ships,level,deaths: total score (no rollover at 99,990), ships left,
+#           wave number, ships lost this game
 #   style_step: 1 on the frame the style key is pressed (next play style), else 0
 #   PET,slot: the shadow style's spared boulder
 #   SEED,lo,hi: sent once at each game start; Lua writes it into the game's
@@ -110,12 +111,10 @@ class Track:
         self.status = status
         self.ram_v = ram_v
         self.hist.append((frame, x, y))
-        f0, x0, y0 = self.hist[0]
-        if frame > f0:
-            # Average over the window: the game does not move every object on
-            # every MAME frame, so single-frame deltas are jittery.
-            self.vx = wrap_delta(x - x0, W) / (frame - f0)
-            self.vy = wrap_delta(y - y0, H) / (frame - f0)
+        # The game's own velocity bytes match the measured motion exactly (rocks,
+        # bullets; saucers to within 0.3 units/frame as they change course) and,
+        # unlike a position average, are right from an object's first frame.
+        self.vx, self.vy = float(ram_v[0]), float(ram_v[1])
 
     @property
     def pos(self):
@@ -254,7 +253,7 @@ class Scorekeeper:
         return s
 
     def token(self):
-        return f"G,{self.total},{self.ships},{self.level}"
+        return f"G,{self.total},{self.ships},{self.level},{len(self.ship_points)}"
 
 
 def summary(n, tracker, proj_n, pilot, mode):

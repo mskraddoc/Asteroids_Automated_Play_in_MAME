@@ -7,7 +7,7 @@
 -- or "-". Each <obj> is "K,slot,x,y" or, while projection is on,
 -- "K,slot,x,y,px,py" where px,py is the position Python projects projN frames
 -- ahead; slot is the object's RAM slot (0-34). "A,x,y" is the
--- autopilot's aim point, "MODE:<text>" its current mode and "G,score,ships,level"
+-- autopilot's aim point, "MODE:<text>" its current mode and "G,score,ships,level,deaths"
 -- the game totals for the score overlay. "SEED,lo,hi" (sent at game start) is
 -- written into the game's random-number generator at zero page 0x5F/0x60.
 -- "PET,slot" marks the shadow style's spared boulder. <style_step> is 1 on the
@@ -409,6 +409,14 @@ local function ai_text()
 	return style and ("Style: " .. style .. "\n" .. state) or state
 end
 
+-- Score overlay lines from the latest "G,score,ships,level,deaths" token.
+local function score_text()
+	local total, deaths = game_stats[2], game_stats[5] or 0
+	local per_death = deaths > 0 and commas(total // deaths) or "-"
+	return string.format("SCORE %s\nSHIPS %d\nLEVEL %d\nDEATHS %d\nPOINTS/DEATH %s",
+		commas(total), game_stats[3], game_stats[4], deaths, per_death)
+end
+
 local function draw_overlay()
 	local ship, aim, pet_slot
 	local listed = {}
@@ -467,8 +475,7 @@ local function draw_overlay()
 		screen:draw_text(4, 30, ai_text(), 0xffffff00, 0x00000000)
 	end
 	if score_on and game_stats then
-		screen:draw_text("right", 4, string.format("SCORE %s\nSHIPS %d\nLEVEL %d",
-			commas(game_stats[2]), game_stats[3], game_stats[4]), 0xffffff00, 0x00000000)
+		screen:draw_text("right", 4, score_text(), 0xffffff00, 0x00000000)
 	end
 	if notice and now() < notice_until then
 		local text = type(notice) == "function" and notice() or notice

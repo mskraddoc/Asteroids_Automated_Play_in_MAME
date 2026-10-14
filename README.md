@@ -62,7 +62,7 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 
 | Style     | Behaviour                                                                                                         |
 |-----------|-------------------------------------------------------------------------------------------------------------------|
-| `classic` | Default. Aims at the highest-priority target and fires; thrusts only to evade                                     |
+| `classic` | Default. Aims at the highest-priority target and fires; returns to the middle between waves                       |
 | `flyer`   | Flies on a drifting throttle (none to full), only along predicted-safe paths; returns to the middle between waves |
 | `shadow`  | Spares one large rock per level and flies close to it (`PET` box) until 2 saucers are killed                      |
 
@@ -81,7 +81,7 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 | `=` / `-` | MAME volume up / down (2 dB steps)                                  |
 | `M`       | Next play style (classic, flyer, shadow)                            |
 
-The score overlay (top right) shows the actual total score, which keeps counting past the arcade's 99,990 rollover (up to 9,999,999,999), the ships remaining and the level (wave) number. Speed and volume changes are shown on screen for 3 seconds; at MAX (unthrottled) the measured speed is shown.
+The score overlay (top right) shows the actual total score, which keeps counting past the arcade's 99,990 rollover (up to 9,999,999,999), the ships remaining, the level (wave) number, deaths this game and points per death. Speed and volume changes are shown on screen for 3 seconds; at MAX (unthrottled) the measured speed is shown.
 
 ## Object Detection Overlay Examples
 
