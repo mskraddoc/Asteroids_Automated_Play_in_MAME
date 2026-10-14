@@ -9,11 +9,20 @@
 #   3. Otherwise (and opportunistically while evading) aim at the highest
 #      priority target - saucers, then small, medium, large rocks - and fire.
 #
+# Play styles change what the ship does when it is not evading:
+#   classic  the above
+#   flyer    thrusts with a throttle that drifts between 0 and full, but only
+#            along paths predicted to stay clear of everything; returns to the
+#            middle of the screen between waves
+#   shadow   spares one large rock per level and flies close to it, until two
+#            saucers have been killed in that level
+#
 # Units: game units (x 0-8191, y 0-6143, y up) and frames. Heading 0-255,
 # 0 = +x, counterclockwise. All constants were measured from RAM in MAME.
 
 import math
-from collections import Counter
+import random
+from collections import Counter, deque
 
 import numpy as np
 
@@ -50,6 +59,28 @@ PRIORITY = (("U", "u"), ("S",), ("M",), ("L",))
 HIT_FRAC = 0.7           # a shot counts as on target if it passes within this fraction of the radius
 MAX_TURN = 42            # heading steps considered each way when aiming (42*3 = half a turn)
 THREAT_KINDS = "LMSUuR"
+
+# Play styles
+STYLES = ("classic", "flyer", "shadow")
+STEER_DV = 3.0           # steer when the ship's velocity is off by more than this (units/frame)
+FLYER_HOLD = (180, 480)  # frames between new throttle levels
+FLYER_RAMP = 60          # frames to ramp to a new level
+FLY_LOOKAHEAD = 20       # flyer thrusts only if thrusting this many frames, then coasting
+                         # to HORIZON, is predicted to stay clear of everything
+FLY_CLEAR = 0            # extra clearance wanted beyond the collision distance (which
+                         # already includes MARGIN)
+FLY_MAX_SPEED = 20.0     # no flyer thrust that adds speed above this (units/frame)
+STEER_BRAKE = 0.2        # units/frame^2 assumed for slowing down (thrust, less the turnaround)
+HOME_MAX_V = 30.0        # top speed returning to the centre
+HOME_DV = 1.5            # tighter tolerance so the ship settles near the centre
+HOME_DONE = (400, 2.0)   # home when this close (units) and this slow (units/frame)
+HOME_GRACE = 180         # frames into a new wave before giving up on getting home
+SHADOW_DIST = 700        # centre-to-centre distance kept from the boulder (~300 units clear)
+SHADOW_BAND = 150        # no closing speed within this many units of SHADOW_DIST
+SHADOW_MAX_V = 10.0
+SHADOW_SAUCERS = 2       # saucer kills in a level that release the boulder
+SHADOW_REACQUIRE = 400   # a large rock this close to the boulder's predicted position is it
+PET_VETO_FRAC = 1.2      # don't fire a shot passing within this fraction of the boulder's radius
 
 # Game start / restart: with no lives left (boot or game over), press Coin then
 # Start after this many frames without a ship
@@ -157,7 +188,8 @@ def bcd(b):
 class Pilot:
     """Stateful autopilot; call step() once per frame."""
 
-    def __init__(self):
+    def __init__(self, style="classic", seed=None):
+        self.rng = random.Random(seed)
         self.fired_last = False
         self.last_turn = 0        # +1 Left / -1 Right / 0, decided last frame (not yet in RAM)
         self.target_uid = None
@@ -168,6 +200,12 @@ class Pilot:
         self.bullet_v = {}        # heading -> learned bullet velocity relative to ship
         self.pending_shots = {}   # spawn frame -> (heading, predicted pos, predicted vel)
         self.heading_hist = []    # (frame, heading) for the last few frames
+        self.steering = False     # hysteresis for _steer
+        # saucer kills this level (shadow)
+        self.level = None
+        self.saucer_kills = 0
+        self.saucer_boom = None   # frame a saucer exploded, waiting for its points
+        self.gains = deque(maxlen=8)  # (frame, score gained)
         # stats
         self.spawn_err_sum = 0.0
         self.spawn_n = 0
@@ -177,9 +215,25 @@ class Pilot:
         self.misses = 0
         self.deaths = 0
         self.score = 0
+        self.set_style(style)
 
-    def step(self, frame, tracker, ship_slot, zp, ship_vel):
-        """Return (inputs, overlay_tokens, mode)."""
+    def set_style(self, style):
+        """Switch play style and clear the per-style state."""
+        assert style in STYLES, style
+        self.style = style
+        self.throttle = self.fly_target = self.fly_acc = 0.0
+        self.fly_next = 0         # frame to pick the next throttle level
+        self.home_until = None    # flyer: frame to stop heading home (None = not homing)
+        self.pet_uid = None       # shadow's boulder
+        self.pet_last = None      # (frame, x, y, vx, vy) last seen
+        self.steering = False
+
+    def step(self, frame, tracker, ship_slot, zp, ship_vel, saucer_status=0, level=0):
+        """Return (inputs, overlay_tokens, mode).
+
+        saucer_status: the saucer slot's RAM status byte (>= 0x80 while exploding).
+        level: the wave number, for resetting the shadow style's saucer count.
+        """
         tracks = tracker.tracks
         # A player bullet that vanishes with life left (status >= 2) hit something.
         for t in tracker.ended:
@@ -188,7 +242,11 @@ class Pilot:
                     self.hits += 1
                 else:
                     self.misses += 1
-        self.score = (bcd(zp[0x53]) * 100 + bcd(zp[0x52])) * 10
+        score = (bcd(zp[0x53]) * 100 + bcd(zp[0x52])) * 10
+        gain = (score - self.score) % 100_000
+        self.gains.append((frame, gain if gain < 50_000 else 0))
+        self.score = score
+        self._count_saucer_kills(frame, tracker.ended, saucer_status, level)
         lives = zp[0x57]
         if self.lives is not None and lives < self.lives:
             self.deaths += 1
@@ -198,7 +256,8 @@ class Pilot:
         if ship is None or ship.kind != "H":
             self.fired_last = False
             self.last_turn = 0
-            return self._restart(lives), [], "WAIT"
+            mode = self._mode_name("WAIT")
+            return self._restart(lives), [f"MODE:{mode}"], mode
         self.no_ship_frames = 0
         self.restart_t = None
 
@@ -216,6 +275,12 @@ class Pilot:
         inputs = set()
         overlay = []
 
+        # Shadow: the boulder is spared, so leave it out of the target lists.
+        pet = self._pet(frame, objs, pos) if self.style == "shadow" else None
+        if pet is not None:
+            overlay.append(f"PET,{next(s for s, t in tracks.items() if t is pet)}")
+        targets = [t for t in objs if t is not pet]
+
         # 1-2. Threat check and evasion plan.
         coast = first_hit(simulate_ship(pos, ship_vel, heading, None, 0), tarr)
         evade = None
@@ -225,27 +290,32 @@ class Pilot:
                 inputs.add("H")
 
         # 3. Aim: the (target, reachable heading) whose simulated shot hits soonest.
-        plan = self._pick_target(objs, pos, ship_vel, heading)
+        plan = self._pick_target(targets, pos, ship_vel, heading)
         tgt = plan["track"] if plan else None
         if plan is not None:
             overlay.append(f"A,{plan['aim'][0]},{plan['aim'][1]}")
 
         turn = None
+        detail = ""
         if isinstance(evade, float):
-            mode = "EVADE"
+            action = "EVADE"
             d = heading_diff(evade, heading)
             turn = "L" if d > 1.5 else "R" if d < -1.5 else None
             if abs(d) <= THRUST_ALIGN:
                 inputs.add("T")
         else:
-            mode = "ATTACK-" + tgt.kind if tgt else "IDLE"
+            action = "ATTACK-" + tgt.kind if tgt else "IDLE"
             if plan is not None and plan["k"] != 0:
                 turn = "L" if plan["k"] > 0 else "R"
+            if evade is None:
+                turn, action, detail = self._style_move(frame, objs, pos, ship_vel, heading,
+                                                        pet, turn, action, inputs, tarr)
 
         # 4. Fire when a shot from the current heading would hit an allowed target.
         n_bullets = sum(1 for t in objs if t.kind == "B")
         if (not self.fired_last and n_bullets < MAX_BULLETS
-                and self._hits_now(objs, pos, ship_vel, heading, plan)):
+                and self._hits_now(targets, pos, ship_vel, heading, plan)
+                and not (pet is not None and self._would_hit(pet, pos, ship_vel, heading))):
             inputs.add("F")
             self.shots += 1
             turn = None  # hold the heading so the bullet leaves along it
@@ -255,9 +325,145 @@ class Pilot:
         self.last_turn = 1 if turn == "L" else -1 if turn == "R" else 0
         self.fired_last = "F" in inputs
 
-        self.modes[mode.split("-")[0]] += 1
+        self.modes[action.split("-")[0]] += 1
+        mode = self._mode_name(action, detail)
         overlay.append(f"MODE:{mode}")
         return "".join(sorted(inputs)) or "-", overlay, mode
+
+    def _mode_name(self, action, detail=""):
+        """e.g. SHADOW_1/2_FOLLOW; tokens carry no spaces, Lua shows "_" as a space."""
+        return "_".join(w for w in (self.style.upper(), detail, action) if w)
+
+    def _style_move(self, frame, objs, pos, vel, heading, pet, turn, action, inputs, tarr):
+        """Style-specific steering and thrust while not evading.
+
+        tarr: the threat arrays used for the evasion check.
+        Returns (turn, action, detail); may add "T" to inputs.
+        """
+        detail = ""
+        if self.style == "flyer":
+            # Between waves (no rocks) fly back to the middle and stop there; keep at
+            # it for up to HOME_GRACE frames into the next wave.
+            if not any(t.kind in "LMS" for t in objs):
+                self.home_until = math.inf
+            elif self.home_until == math.inf:
+                self.home_until = frame + HOME_GRACE
+            if self.home_until is not None:
+                d = math.hypot(wrap(W / 2 - pos[0], W), wrap(H / 2 - pos[1], H))
+                if frame > self.home_until or (self.home_until != math.inf and d < HOME_DONE[0]
+                                               and math.hypot(*vel) < HOME_DONE[1]):
+                    self.home_until = None
+            if self.home_until is not None:
+                action = "HOME"
+                s = self._steer(pos, vel, heading, (W / 2, H / 2), (0.0, 0.0), 0, 0,
+                                HOME_MAX_V, HOME_DV)
+                if s:
+                    turn = s[0]
+                    if s[1] and self._thrust_safe(pos, vel, heading, tarr, cap=False):
+                        inputs.add("T")
+            else:
+                if frame >= self.fly_next:
+                    self.fly_target = self.rng.random()
+                    self.fly_next = frame + self.rng.randint(*FLYER_HOLD)
+                step = 1 / FLYER_RAMP
+                self.throttle += max(-step, min(step, self.fly_target - self.throttle))
+                # Thrust credit builds with the throttle; it is spent only on a safe
+                # thrust, so a refused frame thrusts later instead of being lost.
+                self.fly_acc = min(self.fly_acc + self.throttle, 2.0)
+                if self.fly_acc >= 1:
+                    if self._thrust_safe(pos, vel, heading, tarr):
+                        self.fly_acc -= 1
+                        inputs.add("T")
+                    else:
+                        action = "HOLD"
+                detail = f"{round(self.throttle * 100)}%"
+        elif self.style == "shadow":
+            detail = f"{self.saucer_kills}/{SHADOW_SAUCERS}"
+            if pet is not None:
+                s = self._steer(pos, vel, heading, pet.pos, (pet.vx, pet.vy), SHADOW_DIST,
+                                SHADOW_BAND, SHADOW_MAX_V, STEER_DV)
+                if s:
+                    action = "FOLLOW"
+                    turn = s[0]
+                    if s[1]:
+                        inputs.add("T")
+        return turn, action, detail
+
+    def _thrust_safe(self, pos, vel, heading, tarr, cap=True):
+        """Is thrusting along the current heading safe? Simulates FLY_LOOKAHEAD frames
+        of thrust then coasting, out to HORIZON, against every threat's predicted
+        motion. With cap, also refuses thrust that adds speed above FLY_MAX_SPEED."""
+        if cap:
+            c, sn = heading_vec(heading)
+            if math.hypot(*vel) >= FLY_MAX_SPEED and vel[0] * c + vel[1] * sn > 0:
+                return False
+        t_hit, clearance = first_hit(simulate_ship(pos, vel, heading, heading, FLY_LOOKAHEAD), tarr)
+        return t_hit >= HORIZON + 1 and clearance >= FLY_CLEAR
+
+    def _steer(self, pos, vel, heading, tpos, tvel, standoff, band, max_v, tol):
+        """Match velocity with a target point moving at tvel, closing to within
+        `band` of `standoff` units away, at up to max_v and slow enough to stop
+        in time. Returns (turn or None, thrust) or None when close enough."""
+        dx, dy = wrap(tpos[0] - pos[0], W), wrap(tpos[1] - pos[1], H)
+        dist = math.hypot(dx, dy)
+        err = max(0.0, abs(dist - standoff) - band)
+        closing = math.copysign(min(max_v, math.sqrt(2 * STEER_BRAKE * err)), dist - standoff)
+        ux, uy = (dx / dist, dy / dist) if dist > 1 else (0.0, 0.0)
+        dvx = tvel[0] + closing * ux - vel[0]
+        dvy = tvel[1] + closing * uy - vel[1]
+        # Hysteresis: once steering, keep going until well inside the tolerance.
+        if math.hypot(dvx, dvy) <= (tol / 2 if self.steering else tol):
+            self.steering = False
+            return None
+        self.steering = True
+        d = heading_diff(heading_of(dvx, dvy), heading)
+        return ("L" if d > 1.5 else "R" if d < -1.5 else None), abs(d) <= THRUST_ALIGN
+
+    def _pet(self, frame, objs, pos):
+        """Shadow's boulder track, choosing one if needed; None once released."""
+        if self.saucer_kills >= SHADOW_SAUCERS:
+            self.pet_uid = None
+            return None
+        pet = next((t for t in objs if t.uid == self.pet_uid), None)
+        if pet is None:
+            bigs = [t for t in objs if t.kind == "L"]
+            if not bigs:
+                self.pet_uid = None
+                return None
+            pet = None
+            if self.pet_last is not None:
+                # The game may move a rock to another RAM slot (a new track); find it again.
+                f0, x0, y0, vx, vy = self.pet_last
+                px, py = x0 + vx * (frame - f0), y0 + vy * (frame - f0)
+                near = min(bigs, key=lambda t: math.hypot(wrap(t.pos[0] - px, W), wrap(t.pos[1] - py, H)))
+                if math.hypot(wrap(near.pos[0] - px, W), wrap(near.pos[1] - py, H)) < SHADOW_REACQUIRE:
+                    pet = near
+            if pet is None:
+                pet = min(bigs, key=lambda t: math.hypot(wrap(t.pos[0] - pos[0], W), wrap(t.pos[1] - pos[1], H)))
+            self.pet_uid = pet.uid
+        self.pet_last = (frame, pet.pos[0], pet.pos[1], pet.vx, pet.vy)
+        return pet
+
+    def _count_saucer_kills(self, frame, ended, saucer_status, level):
+        """Count saucers the player destroyed this level: the saucer explodes
+        (status >= 0x80, rather than flying off) and at least 200 points arrive."""
+        if level != self.level:
+            self.level = level
+            self.saucer_kills = 0
+            self.pet_uid = self.pet_last = None
+        if any(t.kind in "Uu" for t in ended) and saucer_status >= 0x80:
+            self.saucer_boom = frame
+        if self.saucer_boom is not None:
+            if any(g >= 200 and abs(f - self.saucer_boom) <= 3 for f, g in self.gains):
+                self.saucer_kills += 1
+                self.saucer_boom = None
+            elif frame > self.saucer_boom + 3:
+                self.saucer_boom = None
+
+    def _would_hit(self, track, pos, vel, heading):
+        """Would a shot from the current heading pass near this track?"""
+        hit, _ = self._shot_hits([track], pos, vel, heading, np.array([0]), PET_VETO_FRAC)
+        return bool(hit.any())
 
     def _plan_evade(self, pos, vel, heading, tarr, coast):
         """Best escape heading (float), "H" for hyperspace, or None to coast.
@@ -285,11 +491,11 @@ class Pilot:
         h = int(h) % 256
         return self.bullet_v.get(h) or default_bullet_v(h)
 
-    def _shot_hits(self, targets, pos, vel, heading, ks):
+    def _shot_hits(self, targets, pos, vel, heading, ks, frac=HIT_FRAC):
         """Simulate firing after turning k steps, for each target and each k in ks.
 
         Returns (hit, first): boolean (targets, ks) and the frame of flight at
-        which each shot first comes within HIT_FRAC of the target's radius.
+        which each shot first comes within frac of the target's radius.
         """
         hs = (heading + TURN_RATE * ks) % 256
         bo = np.array([self.bv(h) for h in hs], float)                    # (nk, 2)
@@ -305,7 +511,7 @@ class Pilot:
         t = np.arange(BULLET_LIFE, dtype=float)[None, None, :]
         dx = wrap(d0[..., 0:1] + rv[..., 0:1] * t, W)                     # (m, nk, L)
         dy = wrap(d0[..., 1:2] + rv[..., 1:2] * t, H)
-        r = np.array([RADIUS[tr.kind] for tr in targets], float)[:, None, None] * HIT_FRAC
+        r = np.array([RADIUS[tr.kind] for tr in targets], float)[:, None, None] * frac
         inside = np.hypot(dx, dy) < r
         return inside.any(axis=2), np.argmax(inside, axis=2)
 

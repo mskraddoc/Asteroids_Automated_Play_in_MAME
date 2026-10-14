@@ -1,6 +1,6 @@
 -- ast_link.lua
 -- Lock-step link between MAME (Asteroids) and a Python server (ast_server.py).
--- Each emulated frame: send "FRAME <n> <nram> <projN>\n" + RAM bytes (zero page,
+-- Each emulated frame: send "FRAME <n> <nram> <projN> <style_step>\n" + RAM bytes (zero page,
 -- then object page 0x200), block until "ACK <n> <inputs> <obj>...\n" arrives,
 -- press the controls Python chose, then overlay boxes for the objects.
 -- <inputs> is letters L R T F H C S (left right thrust fire hyperspace coin start)
@@ -10,12 +10,15 @@
 -- autopilot's aim point, "MODE:<text>" its current mode and "G,score,ships,level"
 -- the game totals for the score overlay. "SEED,lo,hi" (sent at game start) is
 -- written into the game's random-number generator at zero page 0x5F/0x60.
+-- "PET,slot" marks the shadow style's spared boulder. <style_step> is 1 on the
+-- frame M is pressed (Python switches to the next play style), else 0.
 --
 -- Keys: V toggles the projection display, ] / [ increase / decrease projN,
 -- I toggles the autopilot (off = you play), B toggles the object boxes and aim
 -- line, O toggles the object list, A toggles the AI state text, S toggles the
 -- score overlay, . / , speed emulation up / down (0.25x-8x, then MAX =
--- unthrottled, which shows the measured speed), = / - raise / lower volume.
+-- unthrottled, which shows the measured speed), = / - raise / lower volume,
+-- M switches to the next autopilot play style.
 --
 -- Run (from mame/):
 --   ./mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
@@ -33,6 +36,7 @@ local KEY_AI_TEXT = "KEYCODE_A"
 local KEY_SCORE = "KEYCODE_S"
 local KEY_FASTER, KEY_SLOWER = "KEYCODE_STOP", "KEYCODE_COMMA"
 local KEY_VOL_UP, KEY_VOL_DOWN = "KEYCODE_EQUALS", "KEYCODE_MINUS"
+local KEY_STYLE = "KEYCODE_M"
 local PROJ_STEP, PROJ_MIN, PROJ_MAX = 5, 5, 300
 local proj_on = false
 local proj_n = 30
@@ -83,6 +87,7 @@ local keys = {
 	slower = input:code_from_token(KEY_SLOWER),
 	vol_up = input:code_from_token(KEY_VOL_UP),
 	vol_down = input:code_from_token(KEY_VOL_DOWN),
+	style = input:code_from_token(KEY_STYLE),
 }
 
 -- Input letter from Python -> port field
@@ -125,6 +130,7 @@ local game_stats    -- latest "G" token: { "G", score, ships, level }
 local notice, notice_until = nil, 0  -- speed / volume message (string or function) and expiry
 local measured_speed                 -- emulated seconds per real second, last window
 local t_wall0, t_emu0                -- start of the current measuring window
+local style_step = 0                 -- 1 asks Python for the next play style
 
 -- Wall-clock seconds; frame counts would stretch or shrink with the speed setting.
 local function now()
@@ -177,6 +183,11 @@ local function set_speed(i)
 		end
 		show_notice(s)
 	end
+end
+
+-- The style is the first word of the AI mode, e.g. "SHADOW 1/2 FOLLOW".
+local function style_notice()
+	return "Style: " .. (ai_mode:match("^%S+") or "")
 end
 
 local function change_volume(step)
@@ -248,6 +259,10 @@ local function poll_keys()
 	if key_pressed("vol_down") then
 		change_volume(-VOL_STEP)
 	end
+	if key_pressed("style") then
+		style_step = 1
+		show_notice(style_notice)
+	end
 	if key_pressed("ai") then
 		ai_on = not ai_on
 		if not ai_on then
@@ -279,7 +294,8 @@ local function on_frame()
 
 	local ram = progspace:read_range(0x00, 0xff, 8) .. progspace:read_range(0x200, 0x2ff, 8)
 	local n_ahead = proj_on and proj_n or 0
-	sock:write("FRAME " .. frame .. " " .. #ram .. " " .. n_ahead .. "\n" .. ram)
+	sock:write("FRAME " .. frame .. " " .. #ram .. " " .. n_ahead .. " " .. style_step .. "\n" .. ram)
+	style_step = 0
 
 	local reply = read_line(TIMEOUT_SECS)
 	if not reply then
@@ -366,7 +382,7 @@ local LIST_INFO = {  -- kind -> type name, score value
 
 local function draw_object_list(objs)
 	local row_h = 9 * LIST_SCALE
-	local x, y = 4, 60
+	local x, y = 4, 90  -- below the two-line AI text
 	draw_small(x, y, string.format("%2s %-8s %4s %4s %4s", "#", "TYPE", "X", "Y", "PTS"), 0xffffff00)
 	table.sort(objs, function(a, b) return a[2] < b[2] end)
 	for _, o in ipairs(objs) do
@@ -384,12 +400,27 @@ local function commas(n)
 	return s
 end
 
+local PET_COLOR = 0xffff00ff
+
+-- Two lines: the play style (first word of the AI mode), then the rest of the mode.
+local function ai_text()
+	local style, rest = ai_mode:match("^(%S+)%s*(.*)$")
+	local state = ai_on and ("AI " .. (rest or "")) or "AI OFF"
+	return style and ("Style: " .. style .. "\n" .. state) or state
+end
+
 local function draw_overlay()
-	local ship, aim
+	local ship, aim, pet_slot
 	local listed = {}
+	for _, o in ipairs(latest_objects) do
+		if o[1] == "PET" then
+			pet_slot = o[2]
+		end
+	end
 	for _, o in ipairs(latest_objects) do
 		local kind, x, y, px, py = o[1], o[3], o[4], o[5], o[6]
 		local st = STYLE[kind]
+		local is_pet = st and o[2] == pet_slot
 		if kind == "H" then
 			ship = o
 		elseif kind == "A" then
@@ -397,14 +428,16 @@ local function draw_overlay()
 		elseif kind == "G" then
 			game_stats = o
 		elseif kind:sub(1, 5) == "MODE:" then
-			ai_mode = kind:sub(6)
+			ai_mode = (kind:sub(6):gsub("_", " "))
 		end
 		if st then
 			listed[#listed + 1] = o
 			if boxes_on then
-				local lx, ly = draw_obj_box(x, y, st, st.color)
-				if st.label then
-					screen:draw_text(lx + 2, ly, st.label, st.color, 0x00000000)
+				local color = is_pet and PET_COLOR or st.color
+				local lx, ly = draw_obj_box(x, y, st, color)
+				local label = is_pet and "PET" or st.label
+				if label then
+					screen:draw_text(lx + 2, ly, label, color, 0x00000000)
 				end
 			end
 			if proj_on and px then
@@ -431,7 +464,7 @@ local function draw_overlay()
 		screen:draw_text(4, 4, "PROJ +" .. proj_n .. " frames", 0xffffff00, 0x00000000)
 	end
 	if ai_text_on then
-		screen:draw_text(4, 30, ai_on and ("AI " .. ai_mode) or "AI OFF", 0xffffff00, 0x00000000)
+		screen:draw_text(4, 30, ai_text(), 0xffffff00, 0x00000000)
 	end
 	if score_on and game_stats then
 		screen:draw_text("right", 4, string.format("SCORE %s\nSHIPS %d\nLEVEL %d",

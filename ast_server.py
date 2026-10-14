@@ -1,6 +1,6 @@
 # ast_server.py
 # Python side of the lock-step link with MAME (ast_link.lua).
-# Receives "FRAME <n> <nram> <projN>\n" + RAM bytes each emulated frame (zero
+# Receives "FRAME <n> <nram> <projN> [<style_step>]\n" + RAM bytes each emulated frame (zero
 # page 0x00-0xFF, then object page 0x200-0x2FF), decodes the game's object table,
 # tracks objects between frames to estimate velocity, lets the autopilot
 # (ast_ai.Pilot) choose inputs, and replies
@@ -10,10 +10,12 @@
 #   px,py:  position projected projN frames ahead, only when projN > 0
 #   A,x,y:  the autopilot's aim point
 #   G,score,ships,level: total score (no rollover at 99,990), ships left, wave number
+#   style_step: 1 on the frame the style key is pressed (next play style), else 0
+#   PET,slot: the shadow style's spared boulder
 #   SEED,lo,hi: sent once at each game start; Lua writes it into the game's
 #           random-number generator (zero page 0x5F/0x60)
 #
-# Start this first:  python3 ast_server.py [--random on|off|<seed>]
+# Start this first:  python3 ast_server.py [--random on|off|<seed>] [--style <style>]
 #   on (default): pick a fresh seed from the clock and OS entropy, printed so
 #                 the session can be replayed; off: never touch the game's RNG.
 
@@ -25,7 +27,7 @@ import socket
 import time
 from collections import Counter, deque
 
-from ast_ai import Pilot, bcd
+from ast_ai import STYLES, Pilot, bcd
 
 HOST, PORT = "127.0.0.1", 9999
 STATUS_EVERY = 60  # log a status line every N frames
@@ -205,6 +207,8 @@ class Scorekeeper:
         self.prev_score = 0
         self.had_rocks = True
         self.started = False  # True on the frame a game starts
+        self.ship_start = 0    # total when the current ship began
+        self.ship_points = []  # points earned by each ship lost this game
 
     def update(self, zp, objs):
         score = (bcd(zp[0x53]) * 100 + bcd(zp[0x52])) * 10
@@ -213,6 +217,8 @@ class Scorekeeper:
         self.started = bool(ships and not self.ships)
         if self.started:
             self.total = self.level = 0
+            self.ship_start = 0
+            self.ship_points = []
             self.prev_score = score
         if ships or self.ships:
             # The arcade score wraps at 100,000; a large "drop" is a reset, not points.
@@ -221,9 +227,31 @@ class Scorekeeper:
                 self.total = min(self.total + delta, self.MAX_SCORE)
             if rocks and not self.had_rocks:
                 self.level += 1
+            if ships < self.ships:  # a ship lost (an extra ship earned doesn't count)
+                self.ship_points.append(self.total - self.ship_start)
+                self.ship_start = self.total
         self.prev_score = score
         self.ships = ships
         self.had_rocks = rocks
+
+    @property
+    def current_ship_points(self):
+        """Points the ship in play has earned; after game over, the last ship's."""
+        if not self.ships and self.ship_points:
+            return self.ship_points[-1]
+        return self.total - self.ship_start
+
+    def ship_stats(self):
+        """Status-line text: this ship's points, then avg and max per ship once a
+        ship has been lost, then the last-3 average once three have been lost."""
+        s = f"ship={self.current_ship_points:,}"
+        lost = self.ship_points
+        if lost:
+            s += (f" avg/ship={round(sum(lost) / len(lost)):,}"
+                  f" max/ship={max(lost + [self.current_ship_points]):,}")
+        if len(lost) >= 3:
+            s += f" last3={round(sum(lost[-3:]) / 3):,}"
+        return s
 
     def token(self):
         return f"G,{self.total},{self.ships},{self.level}"
@@ -247,13 +275,13 @@ def summary(n, tracker, proj_n, pilot, mode):
     return s
 
 
-def serve(conn, seed):
+def serve(conn, seed, style):
     """seed: None to leave the game's RNG alone, else seeds each game's RNG value."""
     rng = random.Random(seed) if seed is not None else None
     games = 0
     rx = conn.makefile("rb")
     tracker = Tracker()
-    pilot = Pilot()
+    pilot = Pilot(style, seed if seed is not None else 0)
     keeper = Scorekeeper()
     t0 = time.time()
     while True:
@@ -265,6 +293,9 @@ def serve(conn, seed):
             print(f"unexpected message: {line!r}")
             continue
         n, nram, proj_n = int(parts[1]), int(parts[2]), int(parts[3])
+        if len(parts) > 4 and parts[4] == "1":
+            pilot.set_style(STYLES[(STYLES.index(pilot.style) + 1) % len(STYLES)])
+            print(f"style -> {pilot.style}")
         ram = rx.read(nram)
         if len(ram) < nram:
             break
@@ -274,7 +305,8 @@ def serve(conn, seed):
         tracker.update(n, objs)
         keeper.update(zp, objs)
         ship_vel = (signed(page[VX + SHIP_SLOT]), signed(page[VY + SHIP_SLOT]))
-        inputs, overlay, mode = pilot.step(n, tracker, SHIP_SLOT, zp, ship_vel)
+        inputs, overlay, mode = pilot.step(n, tracker, SHIP_SLOT, zp, ship_vel,
+                                           page[SAUCER_SLOT], keeper.level)
         proj = tracker.predict(n, proj_n) if proj_n > 0 else {}
         tokens = []
         for slot, kind, x, y, *_ in objs:
@@ -297,6 +329,7 @@ def serve(conn, seed):
         if n % STATUS_EVERY == 0:
             t1 = time.time()
             print(f"{summary(n, tracker, proj_n, pilot, mode)} total={keeper.total} level={keeper.level}"
+                  f" {keeper.ship_stats()}"
                   f"  {STATUS_EVERY / (t1 - t0):.1f} fps")
             t0 = t1
 
@@ -329,7 +362,11 @@ def main():
     ap = argparse.ArgumentParser(description="Asteroids autopilot server for ast_link.lua")
     ap.add_argument("--random", default="on", type=parse_random, metavar="on|off|SEED",
                     help="randomize each game's starting RNG (default on); a number replays a session")
-    seed = ap.parse_args().random
+    ap.add_argument("--style", default="classic", choices=STYLES,
+                    help="autopilot play style (default classic); the M key in MAME cycles it")
+    args = ap.parse_args()
+    seed = args.random
+    print(f"style: {args.style}")
     if seed is None:
         print("random: off (the game's RNG runs as the ROM leaves it)")
     else:
@@ -343,7 +380,7 @@ def main():
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print(f"MAME connected from {addr}")
         with conn:
-            serve(conn, seed)
+            serve(conn, seed, args.style)
         print("MAME disconnected")
 
 

@@ -56,6 +56,16 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 | `--random off` | Leave the game's generator alone (every run plays the same)          |
 | `--random <N>` | Use seed N, e.g. one printed earlier, to replay that session exactly |
 
+#### Play styles
+
+`--style <name>` picks how the autopilot plays (`M` in MAME switches styles while running). In every style, collision avoidance comes first, exactly as in `classic`; the AI state text shows the style on its own line, e.g. `Style: SHADOW` above `AI 1/2 FOLLOW`.
+
+| Style     | Behaviour                                                                                                         |
+|-----------|-------------------------------------------------------------------------------------------------------------------|
+| `classic` | Default. Aims at the highest-priority target and fires; thrusts only to evade                                     |
+| `flyer`   | Flies on a drifting throttle (none to full), only along predicted-safe paths; returns to the middle between waves |
+| `shadow`  | Spares one large rock per level and flies close to it (`PET` box) until 2 saucers are killed                      |
+
 ## Keys (in MAME)
 
 | Key       | Action                                                              |
@@ -69,6 +79,7 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 | `S`       | Score overlay on/off. Displays actual score beyond 99,990 rollover. |
 | `.` / `,` | Faster / slower emulation (0.25x–8x, default 1x)                    |
 | `=` / `-` | MAME volume up / down (2 dB steps)                                  |
+| `M`       | Next play style (classic, flyer, shadow)                            |
 
 The score overlay (top right) shows the actual total score, which keeps counting past the arcade's 99,990 rollover (up to 9,999,999,999), the ships remaining and the level (wave) number. Speed and volume changes are shown on screen for 3 seconds; at MAX (unthrottled) the measured speed is shown.
 
