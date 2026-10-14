@@ -94,6 +94,11 @@ PET_VETO_FRAC = 1.2      # don't fire a shot passing within this fraction of the
 # Start after this many frames without a ship
 RESTART_AFTER = 180
 
+# Ships (lives byte) kept at most; extra ones are spent on purpose. The game draws
+# every reserve ship each frame, and with ~150+ the main loop falls behind and the
+# watchdog resets the machine.
+LIVES_CAP = 25
+
 
 def wrap(d, size):
     """Shortest signed distance on a wrapping axis (works on numpy arrays)."""
@@ -235,6 +240,7 @@ class Pilot:
         self.hits = 0
         self.misses = 0
         self.deaths = 0
+        self.spent = 0            # ships spent on purpose over LIVES_CAP
         self.score = 0
         self.set_style(style)
 
@@ -270,7 +276,10 @@ class Pilot:
         self._count_saucer_kills(frame, tracker.ended, saucer_status, level)
         lives = zp[0x57]
         if self.lives is not None and lives < self.lives:
-            self.deaths += 1
+            if self.lives > LIVES_CAP:
+                self.spent += 1
+            else:
+                self.deaths += 1
         self.lives = lives
 
         ship = tracks.get(ship_slot)
@@ -295,6 +304,11 @@ class Pilot:
 
         inputs = set()
         overlay = []
+
+        # Over the ship cap: spend ships the way marathon players did, by letting
+        # them die. Too many reserve ships slow the game and trip its watchdog.
+        if lives > LIVES_CAP:
+            return self._spend_ship(objs, pos, heading, overlay)
 
         # Shadow: the boulder is spared, so leave it out of the target lists.
         pet = self._pet(frame, objs, pos) if self.style == "shadow" else None
@@ -361,6 +375,27 @@ class Pilot:
 
         self.modes[action.split("-")[0]] += 1
         mode = self._mode_name(action, detail)
+        overlay.append(f"MODE:{mode}")
+        return "".join(sorted(inputs)) or "-", overlay, mode
+
+    def _spend_ship(self, objs, pos, heading, overlay):
+        """Ram the nearest rock: turn to it and thrust, no evasion, no fire."""
+        inputs = set()
+        rocks = [t for t in objs if t.kind in "LMS"]
+        if rocks:
+            dx, dy = min(((wrap(t.pos[0] - pos[0], W), wrap(t.pos[1] - pos[1], H)) for t in rocks),
+                         key=lambda d: math.hypot(*d))
+            d = heading_diff(heading_of(dx, dy), heading)
+            if d > 1.5:
+                inputs.add("L")
+            elif d < -1.5:
+                inputs.add("R")
+            if abs(d) <= THRUST_ALIGN:
+                inputs.add("T")
+        self.last_turn = 1 if "L" in inputs else -1 if "R" in inputs else 0
+        self.fired_last = False
+        self.modes["SPEND"] += 1
+        mode = self._mode_name("SPEND")
         overlay.append(f"MODE:{mode}")
         return "".join(sorted(inputs)) or "-", overlay, mode
 
@@ -666,5 +701,5 @@ class Pilot:
         done = self.hits + self.misses
         acc = f"{100 * self.hits / done:.0f}%" if done else "-"
         spawn = f"{self.spawn_err_sum / self.spawn_n:.0f}u" if self.spawn_n else "-"
-        return (f"score={self.score} lives={self.lives} deaths={self.deaths} "
+        return (f"score={self.score} lives={self.lives} deaths={self.deaths} spent={self.spent} "
                 f"shots={self.shots} acc={acc} spawn_err={spawn} learned={len(self.bullet_v)} {modes}")
