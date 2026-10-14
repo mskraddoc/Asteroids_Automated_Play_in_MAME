@@ -81,7 +81,6 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 | `=` / `-` | MAME volume up / down (2 dB steps)                                  |
 | `M`       | Next play style (classic, flyer, shadow)                            |
 
-The score overlay (top right) shows the actual total score, which keeps counting past the arcade's 99,990 rollover (up to 9,999,999,999), the ships remaining, the level (wave) number, deaths this game and points per death. Speed and volume changes are shown on screen for 3 seconds; at MAX (unthrottled) the measured speed is shown.
 
 ## Object Detection Overlay Examples
 
