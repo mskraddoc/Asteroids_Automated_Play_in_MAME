@@ -2,7 +2,9 @@
 
 This project contains Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 
-A Lua script running in MAME sends game data to a local Python server. The server decodes the game's object table and decides which controls to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the highest-priority target and fire. The autopilot keeps at most 25 ships, deliberately losing any extra by ramming a rock. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog resets the machine (around 1.7 million points). The Python server sends MAME keypresses back to the MAME Lua script to control gameplay. Information overlays showing what the AI sees can be toggled.
+A Lua script running in MAME sends game data to a local Python server via a socket. The server decodes the game data and decides which controls to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the highest-priority target and fire. The Python server sends MAME keypresses back to the MAME Lua script to control gameplay and information overlays showing what the AI sees can be toggled.
+
+If unchecked, the autopilot bot will earn 100K - 200K points per ship death. The Server will take steps to keep the number of extra ships at or below 25, deliberately losing any extra by ramming into a rock. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog resets the machine (around 1.7 million points).  Killing off ships when the reserve ship total is greater than 25 maintains gameplay speed.  
 
 ## Tested with
 
