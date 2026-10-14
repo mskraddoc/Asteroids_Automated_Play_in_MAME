@@ -58,13 +58,13 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 
 #### Play styles
 
-`--style <name>` picks how the autopilot plays (`M` in MAME switches styles while running). In every style, collision avoidance comes first, exactly as in `classic`; the AI state text shows the style on its own line, e.g. `Style: SHADOW` above `AI 1/2 FOLLOW`.
+`--style <name>` picks how the autopilot plays (`M` in MAME switches styles while running). 
 
 | Style     | Behaviour                                                                                                         |
 |-----------|-------------------------------------------------------------------------------------------------------------------|
 | `classic` | Default. Aims at the highest-priority target and fires; returns to the middle between waves                       |
 | `flyer`   | Flies on a drifting throttle (none to full), only along predicted-safe paths; returns to the middle between waves |
-| `shadow`  | Spares one large rock per level and flies close to it (`PET` box) until 2 saucers are killed                      |
+| `shadow`  | Spares one large rock per level and flies close to it until 2 saucers are killed                      |
 
 ## Keys (in MAME)
 
