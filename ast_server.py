@@ -4,13 +4,15 @@
 # page 0x00-0xFF, then object page 0x200-0x2FF), decodes the game's object table,
 # tracks objects between frames to estimate velocity, lets the autopilot
 # (ast_ai.Pilot) choose inputs, and replies
-# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode> G,score,ships,level,deaths\n".
+# "ACK <n> <inputs> K,slot,x,y[,px,py] ... A,x,y MODE:<mode> G,...\n".
 #   inputs: letters L R T F H (left right thrust fire hyperspace), C S (coin,
 #           start), or "-"
 #   px,py:  position projected projN frames ahead, only when projN > 0
 #   A,x,y:  the autopilot's aim point
-#   G,score,ships,level,deaths: total score (no rollover at 99,990), ships left,
-#           wave number, ships lost this game
+#   G,score,ships,level,deaths,hyper,coll,shot,kami,jumps: total score (no
+#           rollover at 99,990), ships left, wave number, ships lost this game, the
+#           losses by cause (failed hyperspace, collision with a rock or saucer,
+#           saucer shot, spent over the ship cap), hyperspace jumps this game
 #   style_step: 1 on the frame the style key is pressed (next play style), else 0
 #   PET,slot: the shadow style's spared boulder
 #   SEED,lo,hi: sent once at each game start; Lua writes it into the game's
@@ -28,7 +30,7 @@ import socket
 import time
 from collections import Counter, deque
 
-from ast_ai import STYLES, Pilot, bcd
+from ast_ai import LIVES_CAP, STYLES, Pilot, bcd
 
 HOST, PORT = "127.0.0.1", 9999
 STATUS_EVERY = 60  # log a status line every N frames
@@ -42,11 +44,16 @@ PLAYER_BULLET_SLOTS = range(31, 35)
 X_HI, Y_HI, X_LO, Y_LO = 0x69, 0x8C, 0xAF, 0xD2
 VX, VY = 0x23, 0x46  # signed velocity bytes, units/frame
 RNG_LO, RNG_HI = 0x5F, 0x60  # the game's 16-bit random-number generator (never 0)
+HYPER = 0x59  # hyperspace: 0 none, 0x01 jump in progress, 0x80 jump that will kill the ship
 ROCK_SIZE = {4: "L", 2: "M", 0: "S"}
 SAUCER_SIZE = {2: "U", 1: "u"}
 
 # Playfield size in game units; it wraps at the edges.
 W, H = 8192, 6144
+
+# Ways a ship is lost, in overlay order: failed hyperspace, collision with a rock
+# or saucer, saucer shot, spent over the ship cap (kamikaze)
+CAUSES = ("hyper", "coll", "shot", "kami")
 
 HISTORY = 8       # frames of position history kept per object
 MAX_JUMP = 400    # per-frame move larger than this restarts the track
@@ -190,7 +197,8 @@ class Tracker:
 
 
 class Scorekeeper:
-    """Game total score (without the arcade's rollover), ships left and level.
+    """Game total score (without the arcade's rollover), ships left, level, and
+    how each ship was lost.
 
     The level counts waves: rocks reach zero between waves, so each change from
     no rocks to some rocks during a game is a new wave. At game start the attract
@@ -208,8 +216,12 @@ class Scorekeeper:
         self.started = False  # True on the frame a game starts
         self.ship_start = 0    # total when the current ship began
         self.ship_points = []  # points earned by each ship lost this game
+        self.causes = dict.fromkeys(CAUSES, 0)  # ships lost this game, by cause
+        self.jumps = 0         # hyperspace jumps this game
+        self.prev_hyper = 0
 
-    def update(self, zp, objs):
+    def update(self, zp, objs, ended):
+        """ended: tracks that disappeared this frame (Tracker.ended)."""
         score = (bcd(zp[0x53]) * 100 + bcd(zp[0x52])) * 10
         ships = zp[0x57]
         rocks = any(o[0] in ROCK_SLOTS for o in objs)
@@ -218,6 +230,8 @@ class Scorekeeper:
             self.total = self.level = 0
             self.ship_start = 0
             self.ship_points = []
+            self.causes = dict.fromkeys(CAUSES, 0)
+            self.jumps = 0
             self.prev_score = score
         if ships or self.ships:
             # The arcade score wraps at 100,000; a large "drop" is a reset, not points.
@@ -229,9 +243,26 @@ class Scorekeeper:
             if ships < self.ships:  # a ship lost (an extra ship earned doesn't count)
                 self.ship_points.append(self.total - self.ship_start)
                 self.ship_start = self.total
+                self.causes[self._cause(ended)] += 1
+            if zp[HYPER] and not self.prev_hyper:
+                self.jumps += 1
+        self.prev_hyper = zp[HYPER]
         self.prev_score = score
         self.ships = ships
         self.had_rocks = rocks
+
+    def _cause(self, ended):
+        """Why the ship was just lost. A saucer bullet that hits the ship is removed
+        on that frame; a rock or saucer it hits starts exploding (also gone from the
+        object list). A failed jump kills the ship on return, the frame after the
+        hyperspace flag was 0x80."""
+        if self.ships > LIVES_CAP:
+            return "kami"
+        if self.prev_hyper == 0x80:
+            return "hyper"
+        if any(t.kind == "R" for t in ended):
+            return "shot"
+        return "coll"
 
     @property
     def current_ship_points(self):
@@ -243,7 +274,8 @@ class Scorekeeper:
     def ship_stats(self):
         """Status-line text: this ship's points, then avg and max per ship once a
         ship has been lost, then the last-3 average once three have been lost."""
-        s = f"ship={self.current_ship_points:,}"
+        s = (f"causes={'/'.join(str(n) for n in self.causes.values())}"
+             f" jumps={self.jumps} ship={self.current_ship_points:,}")
         lost = self.ship_points
         if lost:
             s += (f" avg/ship={round(sum(lost) / len(lost)):,}"
@@ -253,7 +285,8 @@ class Scorekeeper:
         return s
 
     def token(self):
-        return f"G,{self.total},{self.ships},{self.level},{len(self.ship_points)}"
+        causes = ",".join(str(n) for n in self.causes.values())
+        return f"G,{self.total},{self.ships},{self.level},{len(self.ship_points)},{causes},{self.jumps}"
 
 
 def summary(n, tracker, proj_n, pilot, mode):
@@ -302,7 +335,7 @@ def serve(conn, seed, style):
         zp, page = ram[:256], ram[256:]
         objs = decode_objects(page)
         tracker.update(n, objs)
-        keeper.update(zp, objs)
+        keeper.update(zp, objs, tracker.ended)
         ship_vel = (signed(page[VX + SHIP_SLOT]), signed(page[VY + SHIP_SLOT]))
         inputs, overlay, mode = pilot.step(n, tracker, SHIP_SLOT, zp, ship_vel,
                                            page[SAUCER_SLOT], keeper.level)

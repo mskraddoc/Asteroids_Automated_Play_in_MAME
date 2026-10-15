@@ -7,8 +7,9 @@
 -- or "-". Each <obj> is "K,slot,x,y" or, while projection is on,
 -- "K,slot,x,y,px,py" where px,py is the position Python projects projN frames
 -- ahead; slot is the object's RAM slot (0-34). "A,x,y" is the
--- autopilot's aim point, "MODE:<text>" its current mode and "G,score,ships,level,deaths"
--- the game totals for the score overlay. "SEED,lo,hi" (sent at game start) is
+-- autopilot's aim point, "MODE:<text>" its current mode and
+-- "G,score,ships,level,deaths,hyper,coll,shot,kami,jumps" the game totals for the
+-- score overlay (ships lost by cause, then hyperspace jumps). "SEED,lo,hi" (sent at game start) is
 -- written into the game's random-number generator at zero page 0x5F/0x60.
 -- "PET,slot" marks the shadow style's spared boulder. <style_step> is 1 on the
 -- frame M is pressed (Python switches to the next play style), else 0.
@@ -126,7 +127,7 @@ local frame = 0
 local linked = true
 local latest_objects = {}
 local ai_mode = ""
-local game_stats    -- latest "G" token: { "G", score, ships, level }
+local game_stats    -- latest "G" token: { "G", score, ships, level, deaths, 4 causes, jumps }
 local notice, notice_until = nil, 0  -- speed / volume message (string or function) and expiry
 local measured_speed                 -- emulated seconds per real second, last window
 local t_wall0, t_emu0                -- start of the current measuring window
@@ -355,8 +356,10 @@ local GLYPHS = {
 	P = "0600 0040 4043 4303",          R = "0600 0040 4043 4303 2346",
 	S = "4130 3010 1001 0102 0213 1333 3344 4445 4536 3616 1605",
 	T = "0040 2026",
+	N = "0006 0046 4640",
 	U = "0006 0646 4046",               X = "0046 4006",
-	Y = "0023 4023 2326",               ["-"] = "1333",
+	Y = "0023 4023 2326",               Z = "0040 4006 0646",
+	["-"] = "1333",
 	[","] = "2516",                     ["#"] = "1115 3135 0232 0434",
 }
 
@@ -409,12 +412,38 @@ local function ai_text()
 	return style and ("Style: " .. style .. "\n" .. state) or state
 end
 
--- Score overlay lines from the latest "G,score,ships,level,deaths" token.
+-- Score overlay lines from the latest "G" token.
 local function score_text()
-	local total, deaths = game_stats[2], game_stats[5] or 0
-	local per_death = deaths > 0 and commas(total // deaths) or "-"
-	return string.format("SCORE %s\nSHIPS %d\nLEVEL %d\nDEATHS %d\nPOINTS/DEATH %s",
-		commas(total), game_stats[3], game_stats[4], deaths, per_death)
+	return string.format("SCORE %s\nSHIPS %d\nLEVEL %d\nDEATHS %d",
+		commas(game_stats[2]), game_stats[3], game_stats[4], game_stats[5] or 0)
+end
+
+-- Small-font lines under DEATHS: ships lost by cause (G token fields 6-9), each
+-- with the color its line takes for FLASH_SECS after a loss of that kind.
+local CAUSES = {
+	{ "HYPER", 0xff3080ff },       -- failed hyperspace jump
+	{ "COLLISIONS", 0xffff9000 },  -- hit a rock or saucer
+	{ "SHOT", 0xffff2020 },        -- hit by a saucer bullet
+	{ "KAMIKAZE", 0xffff00ff },    -- spent over the autopilot's ship cap
+}
+local FLASH_SECS = 2  -- wall clock, so the same at any emulation speed
+local cause_seen = {}   -- count last drawn, per cause
+local flash_until = {}  -- wall-clock time each cause's line stops flashing
+
+-- Draw the cause lines right-aligned from y down; returns the y below them.
+local function draw_causes(y)
+	for i, c in ipairs(CAUSES) do
+		local n = game_stats[5 + i] or 0
+		if cause_seen[i] and n > cause_seen[i] then
+			flash_until[i] = now() + FLASH_SECS
+		end
+		cause_seen[i] = n
+		local text = string.format("%-10s %5d", c[1], n)
+		local color = now() < (flash_until[i] or 0) and c[2] or 0xffffff00
+		draw_small(screen.width - #text * 6 * LIST_SCALE - 4, y, text, color)
+		y = y + 9 * LIST_SCALE
+	end
+	return y
 end
 
 local function draw_overlay()
@@ -476,6 +505,9 @@ local function draw_overlay()
 	end
 	if score_on and game_stats then
 		screen:draw_text("right", 4, score_text(), 0xffffff00, 0x00000000)
+		local line_h = manager.ui.line_height * screen.height  -- draw_text's line height
+		local y = draw_causes(4 + 4 * line_h + 2)
+		screen:draw_text("right", y + 2, "HYPERSPACE " .. (game_stats[10] or 0), 0xffffff00, 0x00000000)
 	end
 	if notice and now() < notice_until then
 		local text = type(notice) == "function" and notice() or notice
