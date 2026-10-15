@@ -85,9 +85,9 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 
 ## Object Detection Overlay Examples
 
-<img width="50%" alt="Screenshot 2026-10-11 at 11 18 47 AM" src="https://github.com/user-attachments/assets/746a8c26-4568-41e8-a89b-fb4a9f1210b1" />
-<img width="50%" alt="Screenshot 2026-10-11 at 11 17 15 AM" src="https://github.com/user-attachments/assets/36e4519a-c83f-42b8-bc36-6874749fa58a" />
-<img width="50%" alt="Screenshot 2026-10-11 at 11 15 01 AM" src="https://github.com/user-attachments/assets/65cd985e-1e08-4847-9eb9-ec8eb6bb923d" />
+<img width="50%" alt="Screenshot 2026-10-11 at 11 18 47 AM" src="images/overlay-boxes.png" />
+<img width="50%" alt="Screenshot 2026-10-11 at 11 17 15 AM" src="images/overlay-object-list.png" />
+<img width="50%" alt="Screenshot 2026-10-11 at 11 15 01 AM" src="images/overlay-projection.png" />
 
 ## Video
 
