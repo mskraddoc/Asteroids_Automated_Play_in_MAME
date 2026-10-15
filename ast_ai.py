@@ -8,7 +8,8 @@
 #      EVADE_HEADINGS and thrusting; thrust along the safest one. If the first
 #      thing that would hit is a rock or saucer that a shot can reach in time,
 #      turn to it and shoot it (defensive fire), thrusting when the escape
-#      heading lines up; hyperspace only when neither works.
+#      heading lines up; hyperspace only when neither works and the game's own
+#      collision test (ROM_REACH) agrees that every option still hits.
 #   3. Otherwise (and opportunistically while evading) aim at the highest
 #      priority target - saucers, then small, medium, large rocks - and fire.
 #
@@ -59,7 +60,14 @@ HORIZON = 150            # frames to look ahead for collisions
 DANGER_T = {"S": 90, "M": 90, "L": 90, "R": 90, "U": 90, "u": 90}
 DEFEND_KINDS = "LMSUu"   # shoot these when they are about to hit (saucer bullets can't be)
 HYPER_T = 6              # hyperspace when every option collides sooner than this
-DEFEND_MARGIN = 3        # defensive shot must land this many frames before the predicted hit
+DEFEND_MARGIN = 1        # defensive shot must land this many frames before the predicted hit
+# The game's collision test ($6A55): an object hits the ship when |dx| < A, |dy| < A
+# and |dx| + |dy| < 1.5 A, with A in game units below. RADIUS + SHIP_RADIUS + MARGIN
+# is much larger, which is right for evading but called for hyperspace about twice
+# as often as needed (half the jumps were near misses), so a jump is re-checked
+# against this before it is taken.
+ROM_REACH = {"R": 84, "S": 140, "M": 200, "L": 320, "u": 122, "U": 158}
+HYPER_PAD = 8            # units added to ROM_REACH for that re-check
 EVADE_HEADINGS = 16      # candidate escape directions
 EVADE_THRUST = 25        # frames of thrust simulated for each escape candidate
 THRUST_ALIGN = 12        # thrust only when within this many heading units
@@ -169,6 +177,21 @@ def first_hit(path, threats):
     hit = (clearance < 0).any(axis=0)
     t_hit = int(np.argmax(hit)) if hit.any() else len(path)
     return t_hit, float(clearance.min())
+
+
+def rom_first_hit(path, p, v, reach):
+    """First frame the game's own collision test would fire for a ship path, or
+    len(path). p, v: (n,2) threat positions and velocities; reach: (n,) ROM_REACH
+    plus padding."""
+    if len(reach) == 0:
+        return len(path)
+    t = np.arange(len(path))
+    d = p[:, None, :] + v[:, None, :] * t[None, :, None] - path[None, :, :]
+    dx = np.abs(wrap(d[..., 0], W))
+    dy = np.abs(wrap(d[..., 1], H))
+    a = reach[:, None]
+    hit = ((dx < a) & (dy < a) & (dx + dy < 1.5 * a)).any(axis=0)
+    return int(np.argmax(hit)) if hit.any() else len(path)
 
 
 def hit_times(path, threats):
@@ -323,7 +346,8 @@ class Pilot:
         evade = defend = None
         times = hit_times(coast_path, tarr)
         if any(t_hit < DANGER_T[t.kind] for t_hit, t in zip(times, threats)):
-            evade = self._plan_evade(pos, ship_vel, heading, tarr, coast)
+            reach = np.array([ROM_REACH[t.kind] + HYPER_PAD for t in threats], float)
+            evade = self._plan_evade(pos, ship_vel, heading, tarr, coast, reach)
             defend = self._plan_defend(threats, tarr, coast_path, objs, pos, ship_vel, heading)
             if evade == "H" and defend is None:
                 inputs.add("H")
@@ -565,16 +589,19 @@ class Pilot:
         j = int(np.argmin(np.where(ok, land, np.inf)))
         return {"track": threat, "k": int(ks[j]), "covered": False}
 
-    def _plan_evade(self, pos, vel, heading, tarr, coast):
+    def _plan_evade(self, pos, vel, heading, tarr, coast, reach):
         """Best escape heading (float), "H" for hyperspace, or None to coast.
 
-        coast: first_hit() score of drifting without thrust.
+        coast: first_hit() score of drifting without thrust; reach: each threat's
+        ROM_REACH plus HYPER_PAD, for the check before a jump.
         """
         best_h, best_score = None, coast
         prev_score = None
+        paths = {}
         for k in range(EVADE_HEADINGS):
             h = k * 256 / EVADE_HEADINGS
-            score = first_hit(simulate_ship(pos, vel, heading, h, EVADE_THRUST), tarr)
+            paths[h] = simulate_ship(pos, vel, heading, h, EVADE_THRUST)
+            score = first_hit(paths[h], tarr)
             if self.evade_h is not None and h == self.evade_h:
                 prev_score = score
             if score > best_score:
@@ -584,7 +611,16 @@ class Pilot:
             best_h = self.evade_h
         self.evade_h = best_h
         if best_score[0] <= HYPER_T:
-            return "H"
+            # Jump only if the game's own collision test agrees nothing escapes;
+            # otherwise take the option that it says clears longest.
+            p, v, _ = tarr
+            options = [(rom_first_hit(simulate_ship(pos, vel, heading, None, 0), p, v, reach), None)]
+            options += [(rom_first_hit(path, p, v, reach), h) for h, path in paths.items()]
+            t_best, h_best = max(options, key=lambda o: o[0])
+            if t_best <= HYPER_T:
+                return "H"
+            self.evade_h = h_best
+            return h_best
         return best_h
 
     def bv(self, h):
