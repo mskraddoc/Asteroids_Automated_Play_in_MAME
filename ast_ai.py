@@ -32,19 +32,31 @@ import numpy as np
 
 W, H = 8192, 6144
 
-# Ship and bullet physics
-TURN_RATE = 3            # heading units per frame while Left/Right is held
-THRUST_ACCEL = 0.48      # units/frame^2 along heading
-DRAG = 0.9962            # velocity multiplier per frame
-MAX_SPEED = 40.0         # assumed cap, units/frame
-BULLET_SPEED = 63.6      # units/frame along heading, added to ship velocity
-BULLET_LIFE = 72         # frames; the bullet's status counts down 18..1, one step per 4 frames
+# Ship and bullet physics, as the game does them (ship control $703F, movement $6FC7,
+# fire $6CD7, bullet life $738D); checked frame by frame against RAM in MAME.
+TURN_RATE = 3            # heading units per frame while Left/Right is held (every frame)
+# Thrust and drag act only on frames when the frame counter (zero page $5C) is even.
+# Thrust adds 2 * sine / 256 per axis (0.99 units/frame per step, 0.5 on average);
+# without thrust, drag takes (2 * int + 1) / 256 off a positive velocity, or
+# 2 * int / 256 off a negative one (about x0.9961 per frame). Velocity is 16-bit (the
+# integer byte plus a fraction byte, $64 / $65), each axis is clamped to +-63.996, and
+# the position moves by the integer byte only.
+SIN_TABLE = (0, 3, 6, 9, 12, 16, 19, 22, 25, 28, 31, 34, 37, 40, 43, 46, 49, 51, 54, 57,
+             60, 63, 65, 68, 71, 73, 76, 78, 81, 83, 85, 88, 90, 92, 94, 96, 98, 100, 102,
+             104, 106, 107, 109, 111, 112, 113, 115, 116, 117, 118, 120, 121, 122, 122, 123,
+             124, 125, 125, 126, 126, 126, 127, 127, 127, 127)  # $57B9: a quarter turn
+MAX_V16 = 0x3FFF         # per-axis velocity clamp, in 1/256 units/frame
+# A shot's velocity is sine / 2 per axis (at most 63) plus the ship's integer velocity,
+# clamped to +-BULLET_V_MAX. It starts 1.5x its relative velocity ahead of where the ship
+# was and moves once on the same frame (about 157 units ahead in all). Its life counter
+# starts at 18 and drops on frames when the frame counter is a multiple of 4, so it is
+# in RAM for 68-71 frames.
+BULLET_V_MAX = 111
 MAX_BULLETS = 4
 FIRE_DELAY = 2           # frames from the fire decision until the bullet appears in RAM
 # Inputs also take 2 frames to show up in RAM: a turn decided at frame n changes the
 # heading read at n+2. So at frame n the heading read is missing the turn decided at
 # n-1, and the bullet leaves along that newer heading (3 units = 4 deg off otherwise).
-MUZZLE = 159             # the bullet spawns this far ahead of the ship along the heading
 
 # Collision radii
 RADIUS = {"L": 260, "M": 135, "S": 70, "U": 180, "u": 90, "R": 20}
@@ -68,6 +80,8 @@ DEFEND_MARGIN = 1        # defensive shot must land this many frames before the 
 # against this before it is taken.
 ROM_REACH = {"R": 84, "S": 140, "M": 200, "L": 320, "u": 122, "U": 158}
 HYPER_PAD = 8            # units added to ROM_REACH for that re-check
+# The same test for a player bullet (a point) against each target: reach A in game units
+ROM_SHOT_REACH = {"S": 84, "M": 144, "L": 264, "u": 84, "U": 144}
 EVADE_HEADINGS = 16      # candidate escape directions
 EVADE_THRUST = 25        # frames of thrust simulated for each escape candidate
 THRUST_ALIGN = 12        # thrust only when within this many heading units
@@ -127,37 +141,92 @@ def heading_diff(target, h):
     return (target - h + 128) % 256 - 128
 
 
-def simulate_ship(pos, vel, heading, target_h, thrust_frames, horizon=HORIZON):
-    """Ship positions for frames 0..horizon: turn toward target_h, then thrust.
+def sin_rom(h):
+    """The game's sine of heading h (0-255), -127..127 ($77D5)."""
+    h = int(h) & 0xFF
+    a = h & 0x7F
+    v = SIN_TABLE[0x80 - a if a > 0x40 else a]
+    return -v if h >= 0x80 else v
 
-    target_h None means coast without thrusting.
+
+def cos_rom(h):
+    return sin_rom(int(h) + 0x40)
+
+
+def drag16(v):
+    """One drag step on a 16-bit velocity (1/256 units/frame), as at $70E6."""
+    if v == 0:
+        return 0
+    i = v >> 8
+    return v - (2 * i + 1) if i >= 0 else v - 2 * i
+
+
+def clamp16(v):
+    """The per-axis velocity clamp at $7125."""
+    if v >= 0x4000:
+        return MAX_V16
+    if v < -0x4000:
+        return -MAX_V16
+    return v
+
+
+def simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, pending_thrust=False,
+                  horizon=HORIZON):
+    """Ship positions for frames 0..horizon, stepped exactly as the game does.
+
+    vel16: (vx, vy) in 1/256 units/frame. counter: the frame counter ($5C) at frame 0.
+    heading already includes the turn still in the input pipeline, and pending_thrust
+    says whether thrust is pressed for frame 1 (inputs act 2 frames late). From frame 2
+    the ship turns toward target_h, then thrusts for thrust_frames frames; target_h None
+    coasts.
     """
     x, y = pos
-    vx, vy = vel
-    h = heading
+    vx, vy = vel16
+    h = int(heading) % 256
     path = np.empty((horizon + 1, 2))
     path[0] = x, y
     for t in range(1, horizon + 1):
-        if target_h is not None:
+        thrust = t == 1 and pending_thrust
+        if t > 1 and target_h is not None:
             d = heading_diff(target_h, h)
             if d > 1.5:
-                h += TURN_RATE
+                h = (h + TURN_RATE) % 256
             elif d < -1.5:
-                h -= TURN_RATE
+                h = (h - TURN_RATE) % 256
             elif thrust_frames > 0:
-                cx, cy = heading_vec(h)
-                vx += THRUST_ACCEL * cx
-                vy += THRUST_ACCEL * cy
+                thrust = True
                 thrust_frames -= 1
-        vx *= DRAG
-        vy *= DRAG
-        speed = math.hypot(vx, vy)
-        if speed > MAX_SPEED:
-            vx, vy = vx * MAX_SPEED / speed, vy * MAX_SPEED / speed
-        x += vx
-        y += vy
+        if (counter + t) % 2 == 0:
+            if thrust:
+                vx = clamp16(vx + 2 * cos_rom(h))
+                vy = clamp16(vy + 2 * sin_rom(h))
+            else:
+                vx, vy = drag16(vx), drag16(vy)
+        x += vx >> 8
+        y += vy >> 8
         path[t] = x, y
     return path
+
+
+def octagon_hit(dx, dy, a):
+    """The game's collision test ($6A55) on offsets dx, dy with reach a."""
+    dx, dy = np.abs(dx), np.abs(dy)
+    return (dx < a) & (dy < a) & (dx + dy < 1.5 * a)
+
+
+def bullet_rel(h):
+    """A shot's velocity relative to the ship for heading h (fire $6CD7)."""
+    return cos_rom(h) >> 1, sin_rom(h) >> 1
+
+
+def bullet_life(counter):
+    """Frames a shot that appears on a frame with this counter value stays in RAM."""
+    return 68 + (4 - counter % 4) % 4
+
+
+def frames_left(status, counter):
+    """Further frames a bullet with this life status stays in RAM after this one."""
+    return (4 - counter % 4) + 4 * (status - 1) - 1
 
 
 def first_hit(path, threats):
@@ -187,10 +256,7 @@ def rom_first_hit(path, p, v, reach):
         return len(path)
     t = np.arange(len(path))
     d = p[:, None, :] + v[:, None, :] * t[None, :, None] - path[None, :, :]
-    dx = np.abs(wrap(d[..., 0], W))
-    dy = np.abs(wrap(d[..., 1], H))
-    a = reach[:, None]
-    hit = ((dx < a) & (dy < a) & (dx + dy < 1.5 * a)).any(axis=0)
+    hit = octagon_hit(wrap(d[..., 0], W), wrap(d[..., 1], H), reach[:, None]).any(axis=0)
     return int(np.argmax(hit)) if hit.any() else len(path)
 
 
@@ -207,25 +273,20 @@ def hit_times(path, threats):
     return np.where(hit.any(axis=1), np.argmax(hit, axis=1), len(path))
 
 
-def default_bullet_v(h):
-    """Bullet velocity relative to the ship for heading h, before any is learned."""
-    c, sn = heading_vec(h)
-    return round(BULLET_SPEED * c), round(BULLET_SPEED * sn)
-
-
-def covered(target, bullets):
+def covered(target, bullets, counter):
     """True if a player bullet in flight is predicted to hit target.
 
-    Bullets use the game's exact velocity bytes and their remaining life.
+    Bullets use the game's exact velocity bytes, remaining life and hit test.
+    counter: the frame counter ($5C) now.
     """
     tx, ty = target.pos
-    r = RADIUS[target.kind]
+    a = ROM_SHOT_REACH[target.kind]
     for b in bullets:
-        t = np.arange(max(b.status, 1) * 4)
+        t = np.arange(frames_left(max(b.status, 1), counter) + 1)
         bx, by = b.pos
         dx = wrap((tx - bx) + (target.vx - b.ram_v[0]) * t, W)
         dy = wrap((ty - by) + (target.vy - b.ram_v[1]) * t, H)
-        if (np.hypot(dx, dy) < r).any():
+        if octagon_hit(dx, dy, a).any():
             return True
     return False
 
@@ -241,14 +302,14 @@ class Pilot:
         self.rng = random.Random(seed)
         self.fired_last = False
         self.last_turn = 0        # +1 Left / -1 Right / 0, decided last frame (not yet in RAM)
+        self.last_thrust = False  # thrust decided last frame (not yet in RAM)
+        self.ship_sim = ((0, 0), 0)  # this frame's 16-bit ship velocity and frame counter
         self.target_uid = None
         self.evade_h = None
         self.no_ship_frames = 0
         self.restart_t = None
         self.lives = None
-        self.bullet_v = {}        # heading -> learned bullet velocity relative to ship
         self.pending_shots = {}   # spawn frame -> (heading, predicted pos, predicted vel)
-        self.heading_hist = []    # (frame, heading) for the last few frames
         self.steering = False     # hysteresis for _steer
         # saucer kills this level (shadow)
         self.level = None
@@ -309,6 +370,7 @@ class Pilot:
         if ship is None or ship.kind != "H":
             self.fired_last = False
             self.last_turn = 0
+            self.last_thrust = False
             mode = self._mode_name("WAIT")
             return self._restart(lives), [f"MODE:{mode}"], mode
         self.no_ship_frames = 0
@@ -317,8 +379,8 @@ class Pilot:
         # Effective heading: RAM heading plus the turn still in the input pipeline.
         heading = (zp[0x61] + TURN_RATE * self.last_turn) % 256
         pos = ship.pos
-        self.heading_hist = (self.heading_hist + [(frame, heading)])[-4:]
-        self._check_spawn(frame, tracks, heading, ship_vel)
+        self.ship_sim = ((ship_vel[0] * 256 + zp[0x64], ship_vel[1] * 256 + zp[0x65]), zp[0x5C])
+        self._check_spawn(frame, tracks)
         objs = list(tracks.values())
         threats = [t for t in objs if t.kind in THREAT_KINDS]
         tarr = (np.array([t.pos for t in threats], float).reshape(-1, 2),
@@ -341,7 +403,7 @@ class Pilot:
 
         # 1-2. Threat check, evasion plan, and defensive fire: shoot the rock or
         # saucer about to hit us when a shot can land in time.
-        coast_path = simulate_ship(pos, ship_vel, heading, None, 0)
+        coast_path = self._sim(pos, heading, None, 0)
         coast = first_hit(coast_path, tarr)
         evade = defend = None
         times = hit_times(coast_path, tarr)
@@ -395,6 +457,7 @@ class Pilot:
         if turn:
             inputs.add(turn)
         self.last_turn = 1 if turn == "L" else -1 if turn == "R" else 0
+        self.last_thrust = "T" in inputs
         self.fired_last = "F" in inputs
 
         self.modes[action.split("-")[0]] += 1
@@ -417,6 +480,7 @@ class Pilot:
             if abs(d) <= THRUST_ALIGN:
                 inputs.add("T")
         self.last_turn = 1 if "L" in inputs else -1 if "R" in inputs else 0
+        self.last_thrust = "T" in inputs
         self.fired_last = False
         self.modes["SPEND"] += 1
         mode = self._mode_name("SPEND")
@@ -497,7 +561,7 @@ class Pilot:
             c, sn = heading_vec(heading)
             if math.hypot(*vel) >= FLY_MAX_SPEED and vel[0] * c + vel[1] * sn > 0:
                 return False
-        path = simulate_ship(pos, vel, heading if start is None else start, heading, FLY_LOOKAHEAD)
+        path = self._sim(pos, heading if start is None else start, heading, FLY_LOOKAHEAD)
         t_hit, clearance = first_hit(path, tarr)
         return t_hit >= HORIZON + 1 and clearance >= FLY_CLEAR
 
@@ -578,7 +642,7 @@ class Pilot:
         t_hit, threat = int(times[i]), threats[i]
         if threat.kind not in DEFEND_KINDS:
             return None
-        if covered(threat, [t for t in objs if t.kind == "B"]):
+        if covered(threat, [t for t in objs if t.kind == "B"], self.ship_sim[1]):
             return {"track": threat, "k": 0, "covered": True}
         ks = np.arange(-MAX_TURN, MAX_TURN + 1)
         hit, first = self._shot_hits([threat], pos, vel, heading, ks)
@@ -600,7 +664,7 @@ class Pilot:
         paths = {}
         for k in range(EVADE_HEADINGS):
             h = k * 256 / EVADE_HEADINGS
-            paths[h] = simulate_ship(pos, vel, heading, h, EVADE_THRUST)
+            paths[h] = self._sim(pos, heading, h, EVADE_THRUST)
             score = first_hit(paths[h], tarr)
             if self.evade_h is not None and h == self.evade_h:
                 prev_score = score
@@ -614,7 +678,7 @@ class Pilot:
             # Jump only if the game's own collision test agrees nothing escapes;
             # otherwise take the option that it says clears longest.
             p, v, _ = tarr
-            options = [(rom_first_hit(simulate_ship(pos, vel, heading, None, 0), p, v, reach), None)]
+            options = [(rom_first_hit(self._sim(pos, heading, None, 0), p, v, reach), None)]
             options += [(rom_first_hit(path, p, v, reach), h) for h, path in paths.items()]
             t_best, h_best = max(options, key=lambda o: o[0])
             if t_best <= HYPER_T:
@@ -623,32 +687,38 @@ class Pilot:
             return h_best
         return best_h
 
-    def bv(self, h):
-        h = int(h) % 256
-        return self.bullet_v.get(h) or default_bullet_v(h)
+    def _sim(self, pos, heading, target_h, thrust_frames):
+        """simulate_ship from this frame's exact ship state."""
+        vel16, counter = self.ship_sim
+        return simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, self.last_thrust)
 
     def _shot_hits(self, targets, pos, vel, heading, ks, frac=HIT_FRAC):
         """Simulate firing after turning k steps, for each target and each k in ks.
 
-        Returns (hit, first): boolean (targets, ks) and the frame of flight at
-        which each shot first comes within frac of the target's radius.
+        The shot appears delay = |k| + FIRE_DELAY frames from now, ahead of where the
+        ship was the frame before, with the game's exact velocity and life. Returns
+        (hit, first): boolean (targets, ks) and the frame of flight at which each shot
+        first comes within frac of the game's hit reach for the target.
         """
+        counter = self.ship_sim[1]
         hs = (heading + TURN_RATE * ks) % 256
-        bo = np.array([self.bv(h) for h in hs], float)                    # (nk, 2)
-        ang = hs * 2 * np.pi / 256
-        muz = MUZZLE * np.stack([np.cos(ang), np.sin(ang)], axis=1)       # (nk, 2)
-        delay = (np.abs(ks) + FIRE_DELAY)[None, :, None]                  # (1, nk, 1)
-        p = np.array([t.pos for t in targets], float)[:, None, :]         # (m, 1, 2)
-        v = np.array([(t.vx, t.vy) for t in targets], float)[:, None, :]
+        rel = np.array([bullet_rel(h) for h in hs], float)                 # (nk, 2)
         sv = np.asarray(vel, float)
-        # target - bullet, at frame t of the bullet's flight
-        d0 = p - np.asarray(pos, float) - muz[None] + (v - sv) * delay    # (m, nk, 2)
-        rv = v - sv - bo[None]                                            # (m, nk, 2)
-        t = np.arange(BULLET_LIFE, dtype=float)[None, None, :]
-        dx = wrap(d0[..., 0:1] + rv[..., 0:1] * t, W)                     # (m, nk, L)
+        bvel = np.clip(sv + rel, -BULLET_V_MAX, BULLET_V_MAX)               # (nk, 2)
+        off = np.floor(rel / 2) + rel                                      # spawn offset
+        delay = np.abs(ks) + FIRE_DELAY                                     # (nk,)
+        p = np.array([t.pos for t in targets], float)[:, None, :]          # (m, 1, 2)
+        v = np.array([(t.vx, t.vy) for t in targets], float)[:, None, :]
+        # target - bullet at frame t of the bullet's flight (t = 0: it appears)
+        d0 = (p - np.asarray(pos, float) - off - bvel + v * delay[:, None]
+              - sv * (delay[:, None] - 1))                                  # (m, nk, 2)
+        rv = v - bvel[None]                                                 # (m, nk, 2)
+        life = np.array([bullet_life(counter + d) for d in delay])         # (nk,)
+        t = np.arange(life.max(), dtype=float)[None, None, :]
+        dx = wrap(d0[..., 0:1] + rv[..., 0:1] * t, W)                      # (m, nk, L)
         dy = wrap(d0[..., 1:2] + rv[..., 1:2] * t, H)
-        r = np.array([RADIUS[tr.kind] for tr in targets], float)[:, None, None] * frac
-        inside = np.hypot(dx, dy) < r
+        a = np.array([ROM_SHOT_REACH[tr.kind] for tr in targets], float)[:, None, None] * frac
+        inside = octagon_hit(dx, dy, a) & (t < life[None, :, None])
         return inside.any(axis=2), np.argmax(inside, axis=2)
 
     def _pick_target(self, objs, pos, vel, heading):
@@ -657,7 +727,7 @@ class Pilot:
         bullets = [t for t in objs if t.kind == "B"]
         ks = np.arange(-MAX_TURN, MAX_TURN + 1)
         for ci, kinds in enumerate(PRIORITY):
-            cands = [t for t in objs if t.kind in kinds and not covered(t, bullets)]
+            cands = [t for t in objs if t.kind in kinds and not covered(t, bullets, self.ship_sim[1])]
             if not cands:
                 continue
             hit, first = self._shot_hits(cands, pos, vel, heading, ks)
@@ -683,7 +753,7 @@ class Pilot:
             return False
         kinds = "".join("".join(k) for k in PRIORITY[:plan["class"] + 1])
         bullets = [t for t in objs if t.kind == "B"]
-        targets = [t for t in objs if t.kind in kinds and not covered(t, bullets)]
+        targets = [t for t in objs if t.kind in kinds and not covered(t, bullets, self.ship_sim[1])]
         if not targets:
             return False
         hit, _ = self._shot_hits(targets, pos, vel, heading, np.array([0]))
@@ -691,13 +761,13 @@ class Pilot:
 
     def _expect_spawn(self, frame, pos, vel, heading):
         """Remember where this shot's bullet should appear, to check the model."""
-        c, s = heading_vec(heading)
-        bo = self.bv(heading)
-        p = (pos[0] + vel[0] * FIRE_DELAY + MUZZLE * c, pos[1] + vel[1] * FIRE_DELAY + MUZZLE * s)
+        rel = bullet_rel(heading)
+        p = tuple(pos[i] + vel[i] * (FIRE_DELAY - 1) + (rel[i] >> 1) + rel[i]
+                  + max(-BULLET_V_MAX, min(BULLET_V_MAX, vel[i] + rel[i])) for i in (0, 1))
         self.pending_shots[frame + FIRE_DELAY] = (heading, p)
 
-    def _check_spawn(self, frame, tracks, heading, ship_vel):
-        """Compare a predicted bullet spawn with RAM; learn the exact bullet velocity."""
+    def _check_spawn(self, frame, tracks):
+        """Compare a predicted bullet spawn with RAM (the spawn_err stat)."""
         for f in [f for f in self.pending_shots if f < frame]:
             del self.pending_shots[f]
         exp = self.pending_shots.pop(frame, None)
@@ -710,9 +780,6 @@ class Pilot:
         b = min(new, key=lambda t: math.hypot(wrap(t.pos[0] - px, W), wrap(t.pos[1] - py, H)))
         self.spawn_err_sum += math.hypot(wrap(b.pos[0] - px, W), wrap(b.pos[1] - py, H))
         self.spawn_n += 1
-        # Learn the velocity table only when the heading was steady around the shot.
-        if all(hh == h for _, hh in self.heading_hist):
-            self.bullet_v[h] = (b.ram_v[0] - ship_vel[0], b.ram_v[1] - ship_vel[1])
 
     def _restart(self, lives):
         """After game over, press Coin then Start."""
@@ -738,4 +805,4 @@ class Pilot:
         acc = f"{100 * self.hits / done:.0f}%" if done else "-"
         spawn = f"{self.spawn_err_sum / self.spawn_n:.0f}u" if self.spawn_n else "-"
         return (f"score={self.score} lives={self.lives} deaths={self.deaths} spent={self.spent} "
-                f"shots={self.shots} acc={acc} spawn_err={spawn} learned={len(self.bullet_v)} {modes}")
+                f"shots={self.shots} acc={acc} spawn_err={spawn} {modes}")
