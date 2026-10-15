@@ -412,12 +412,6 @@ local function ai_text()
 	return style and ("Style: " .. style .. "\n" .. state) or state
 end
 
--- Score overlay lines from the latest "G" token.
-local function score_text()
-	return string.format("SCORE %s\nSHIPS %d\nLEVEL %d\nDEATHS %d",
-		commas(game_stats[2]), game_stats[3], game_stats[4], game_stats[5] or 0)
-end
-
 -- Small-font lines under DEATHS: ships lost by cause (G token fields 6-9), each
 -- with the color its line takes for FLASH_SECS after a loss of that kind.
 local CAUSES = {
@@ -430,20 +424,46 @@ local FLASH_SECS = 2  -- wall clock, so the same at any emulation speed
 local cause_seen = {}   -- count last drawn, per cause
 local flash_until = {}  -- wall-clock time each cause's line stops flashing
 
--- Draw the cause lines right-aligned from y down; returns the y below them.
-local function draw_causes(y)
+-- Score panel layout: labels on a left edge, values right-aligned on a right edge.
+local SCORE_WIDEST = "SCORE 888,888,888,888"  -- the panel is this wide
+local PANEL_MARGIN = 4  -- screen pixels from the right edge
+local CAUSE_INDENT = 3  -- small-font characters the cause labels are indented
+local CAUSE_INSET = 3   -- small-font characters the cause counts end left of the values
+
+-- The score overlay from the latest "G" token: SCORE, SHIPS, LEVEL and DEATHS,
+-- the ships lost by cause in the small font, then HYPERSPACE jumps.
+local function draw_score_panel()
+	local yellow = 0xffffff00
+	local line_h = manager.ui.line_height * screen.height  -- draw_text's line height
+	local char_w = 6 * LIST_SCALE                          -- small-font character width
+	local right = screen.width - PANEL_MARGIN
+	local left = right - manager.ui:get_string_width(SCORE_WIDEST) * screen.width
+	local y = 4
+	local function big_row(label, value)
+		screen:draw_text(left, y, label, yellow, 0x00000000)
+		screen:draw_text(right - manager.ui:get_string_width(value) * screen.width, y, value,
+			yellow, 0x00000000)
+		y = y + line_h
+	end
+	big_row("SCORE", commas(game_stats[2]))
+	big_row("SHIPS", tostring(game_stats[3]))
+	big_row("LEVEL", tostring(game_stats[4]))
+	big_row("DEATHS", tostring(game_stats[5] or 0))
+	y = y + 2
 	for i, c in ipairs(CAUSES) do
 		local n = game_stats[5 + i] or 0
 		if cause_seen[i] and n > cause_seen[i] then
 			flash_until[i] = now() + FLASH_SECS
 		end
 		cause_seen[i] = n
-		local text = string.format("%-10s %5d", c[1], n)
-		local color = now() < (flash_until[i] or 0) and c[2] or 0xffffff00
-		draw_small(screen.width - #text * 6 * LIST_SCALE - 4, y, text, color)
+		local color = now() < (flash_until[i] or 0) and c[2] or yellow
+		local count = tostring(n)
+		draw_small(left + CAUSE_INDENT * char_w, y, c[1], color)
+		draw_small(right - (CAUSE_INSET + #count) * char_w, y, count, color)
 		y = y + 9 * LIST_SCALE
 	end
-	return y
+	y = y + 2
+	big_row("HYPERSPACE", tostring(game_stats[10] or 0))
 end
 
 local function draw_overlay()
@@ -504,10 +524,7 @@ local function draw_overlay()
 		screen:draw_text(4, 30, ai_text(), 0xffffff00, 0x00000000)
 	end
 	if score_on and game_stats then
-		screen:draw_text("right", 4, score_text(), 0xffffff00, 0x00000000)
-		local line_h = manager.ui.line_height * screen.height  -- draw_text's line height
-		local y = draw_causes(4 + 4 * line_h + 2)
-		screen:draw_text("right", y + 2, "HYPERSPACE " .. (game_stats[10] or 0), 0xffffff00, 0x00000000)
+		draw_score_panel()
 	end
 	if notice and now() < notice_until then
 		local text = type(notice) == "function" and notice() or notice

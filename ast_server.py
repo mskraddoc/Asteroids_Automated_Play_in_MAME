@@ -205,7 +205,7 @@ class Scorekeeper:
     rocks are cleared before the first wave appears.
     """
 
-    MAX_SCORE = 9_999_999_999
+    MAX_SCORE = 999_999_999_999
 
     def __init__(self):
         self.total = 0
