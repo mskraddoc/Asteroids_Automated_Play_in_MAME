@@ -424,9 +424,11 @@ local FLASH_SECS = 2  -- wall clock, so the same at any emulation speed
 local cause_seen = {}   -- count last drawn, per cause
 local flash_until = {}  -- wall-clock time each cause's line stops flashing
 
--- Score panel layout: labels on a left edge, values right-aligned on a right edge.
-local SCORE_WIDEST = "SCORE 888,888,888,888"  -- the panel is this wide
-local PANEL_MARGIN = 4  -- screen pixels from the right edge
+-- Score panel layout: labels on a left edge, values flush right. Values use
+-- draw_text's own right justification: placing them by a measured width can come
+-- out a little narrow, and the overflow then wraps onto the next row.
+local SCORE_WIDEST = "SCORE  888,888,888,888"  -- the panel is this wide
+local PANEL_PAD = 1.08  -- extra width so a label never touches its value
 local CAUSE_INDENT = 3  -- small-font characters the cause labels are indented
 local CAUSE_INSET = 3   -- small-font characters the cause counts end left of the values
 
@@ -436,13 +438,13 @@ local function draw_score_panel()
 	local yellow = 0xffffff00
 	local line_h = manager.ui.line_height * screen.height  -- draw_text's line height
 	local char_w = 6 * LIST_SCALE                          -- small-font character width
-	local right = screen.width - PANEL_MARGIN
-	local left = right - manager.ui:get_string_width(SCORE_WIDEST) * screen.width
+	local right = screen.width
+	local left = right - manager.ui:get_string_width(SCORE_WIDEST) * screen.width * PANEL_PAD
 	local y = 4
 	local function big_row(label, value)
 		screen:draw_text(left, y, label, yellow, 0x00000000)
-		screen:draw_text(right - manager.ui:get_string_width(value) * screen.width, y, value,
-			yellow, 0x00000000)
+		-- the trailing no-break space keeps the last digit off the screen edge
+		screen:draw_text("right", y, value .. "\u{a0}", yellow, 0x00000000)
 		y = y + line_h
 	end
 	big_row("SCORE", commas(game_stats[2]))
