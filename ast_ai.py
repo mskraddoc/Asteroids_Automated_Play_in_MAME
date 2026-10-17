@@ -26,9 +26,20 @@
 
 import math
 import random
+import warnings
 from collections import Counter, deque
 
 import numpy as np
+
+try:
+    with warnings.catch_warnings():  # numba imports scipy, which may warn about numpy
+        warnings.simplefilter("ignore")
+        from numba import njit
+except ImportError:  # same results, but the collision kernels run as slow plain Python
+    print("ast_ai: numba not found (pip3 install numba); running uncompiled, much slower")
+
+    def njit(*args, **kwargs):
+        return args[0] if args and callable(args[0]) else (lambda f: f)
 
 W, H = 8192, 6144
 
@@ -127,12 +138,6 @@ def wrap(d, size):
     return (d + size / 2) % size - size / 2
 
 
-def wrap_arr(d, size):
-    """wrap() for numpy arrays, ~10x faster (float % is slow in numpy). Only the
-    sign at exactly +-size/2 can differ, which abs/hypot/octagon_hit ignore."""
-    return d - size * np.rint(d / size)
-
-
 def heading_vec(h):
     a = h * 2 * math.pi / 256
     return math.cos(a), math.sin(a)
@@ -159,8 +164,8 @@ def cos_rom(h):
     return sin_rom(int(h) + 0x40)
 
 
-SIN256 = tuple(sin_rom(h) for h in range(256))
-COS256 = tuple(cos_rom(h) for h in range(256))
+SIN256 = np.array([sin_rom(h) for h in range(256)], np.int64)
+COS256 = np.array([cos_rom(h) for h in range(256)], np.int64)
 
 
 def drag16(v):
@@ -180,6 +185,47 @@ def clamp16(v):
     return v
 
 
+# The hot loops below are compiled by numba (cache=True keeps the machine code in
+# __pycache__ between runs). They use float64 and the same operation order as the
+# numpy code they replaced, so decisions are unchanged.
+
+@njit(cache=True)
+def _simulate_ship(x, y, vx, vy, h, steer, target_h, thrust_frames, counter, pending_thrust,
+                   horizon):
+    path = np.empty((horizon + 1, 2))
+    path[0, 0] = x
+    path[0, 1] = y
+    for t in range(1, horizon + 1):
+        thrust = t == 1 and pending_thrust
+        if t > 1 and steer:
+            d = (target_h - h + 128) % 256 - 128
+            if d > 1.5:
+                h = (h + TURN_RATE) % 256
+            elif d < -1.5:
+                h = (h - TURN_RATE) % 256
+            elif thrust_frames > 0:
+                thrust = True
+                thrust_frames -= 1
+        if (counter + t) % 2 == 0:
+            if thrust:  # thrust, then the clamp at $7125
+                vx += 2 * COS256[h]
+                vy += 2 * SIN256[h]
+                vx = MAX_V16 if vx >= 0x4000 else -MAX_V16 if vx < -0x4000 else vx
+                vy = MAX_V16 if vy >= 0x4000 else -MAX_V16 if vy < -0x4000 else vy
+            else:  # drag, as at $70E6
+                if vx != 0:
+                    i = vx >> 8
+                    vx -= 2 * i + 1 if i >= 0 else 2 * i
+                if vy != 0:
+                    i = vy >> 8
+                    vy -= 2 * i + 1 if i >= 0 else 2 * i
+        x += vx >> 8
+        y += vy >> 8
+        path[t, 0] = x
+        path[t, 1] = y
+    return path
+
+
 def simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, pending_thrust=False,
                   horizon=HORIZON):
     """Ship positions for frames 0..horizon, stepped exactly as the game does.
@@ -190,47 +236,24 @@ def simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, pending
     the ship turns toward target_h, then thrusts for thrust_frames frames; target_h None
     coasts.
     """
-    # Hot loop: heading_diff, clamp16 and drag16 are inlined, sine/cosine come from
-    # the tables, and the path is built from lists at the end.
-    x, y = pos
-    vx, vy = vel16
-    h = int(heading) % 256
-    xs, ys = [x], [y]
-    for t in range(1, horizon + 1):
-        thrust = t == 1 and pending_thrust
-        if t > 1 and target_h is not None:
-            d = (target_h - h + 128) % 256 - 128
-            if d > 1.5:
-                h = (h + TURN_RATE) % 256
-            elif d < -1.5:
-                h = (h - TURN_RATE) % 256
-            elif thrust_frames > 0:
-                thrust = True
-                thrust_frames -= 1
-        if (counter + t) % 2 == 0:
-            if thrust:
-                vx += 2 * COS256[h]
-                vy += 2 * SIN256[h]
-                vx = MAX_V16 if vx >= 0x4000 else -MAX_V16 if vx < -0x4000 else vx
-                vy = MAX_V16 if vy >= 0x4000 else -MAX_V16 if vy < -0x4000 else vy
-            else:
-                if vx:
-                    i = vx >> 8
-                    vx -= 2 * i + 1 if i >= 0 else 2 * i
-                if vy:
-                    i = vy >> 8
-                    vy -= 2 * i + 1 if i >= 0 else 2 * i
-        x += vx >> 8
-        y += vy >> 8
-        xs.append(x)
-        ys.append(y)
-    return np.column_stack((xs, ys)).astype(float)
+    return _simulate_ship(int(pos[0]), int(pos[1]), int(vel16[0]), int(vel16[1]),
+                          int(heading) % 256, target_h is not None,
+                          0.0 if target_h is None else float(target_h),
+                          int(thrust_frames), int(counter), bool(pending_thrust), int(horizon))
 
 
-def octagon_hit(dx, dy, a):
+@njit(cache=True)
+def _wrap(d, size):
+    """wrap() for the compiled kernels (round-to-even, so only the sign at exactly
+    +-size/2 can differ, which the distance and octagon tests ignore)."""
+    return d - size * np.rint(d / size)
+
+
+@njit(cache=True)
+def _octagon(dx, dy, a):
     """The game's collision test ($6A55) on offsets dx, dy with reach a."""
-    dx, dy = np.abs(dx), np.abs(dy)
-    return (dx < a) & (dy < a) & (dx + dy < 1.5 * a)
+    dx, dy = abs(dx), abs(dy)
+    return dx < a and dy < a and dx + dy < 1.5 * a
 
 
 def bullet_rel(h):
@@ -241,6 +264,7 @@ def bullet_rel(h):
 BULLET_REL = np.array([bullet_rel(h) for h in range(256)], float)  # (256, 2)
 
 
+@njit(cache=True)
 def bullet_life(counter):
     """Frames a shot that appears on a frame with this counter value stays in RAM."""
     return 68 + (4 - counter % 4) % 4
@@ -251,30 +275,27 @@ def frames_left(status, counter):
     return (4 - counter % 4) + 4 * (status - 1) - 1
 
 
-def path_offsets(paths, p, v):
-    """Wrapped threat-minus-ship offsets (dx, dy), each of shape (n, k, T), for k
-    ship paths (k, T, 2) against n threats moving from p at v ((n,2) arrays)."""
-    t = np.arange(paths.shape[1])
-    obj = p[:, None, :] + v[:, None, :] * t[None, :, None]       # (n, T, 2)
-    d = obj[:, None] - paths[None]                                # (n, k, T, 2)
-    return wrap_arr(d[..., 0], W), wrap_arr(d[..., 1], H)
-
-
-def clearances(paths, threats):
-    """Clearance (n, k, T) of n threats from k ship paths (k, T, 2); < 0 is a hit."""
-    p, v, r = threats
-    dx, dy = path_offsets(paths, p, v)
-    return np.hypot(dx, dy) - (r[:, None, None] + SHIP_RADIUS + MARGIN)
+@njit(cache=True)
+def _first_hits(paths, p, v, r):
+    k, n_t = paths.shape[0], paths.shape[1]
+    t_hit = np.full(k, n_t)
+    clear = np.full(k, np.inf)
+    for j in range(k):
+        for t in range(n_t):
+            for i in range(len(r)):
+                dx = _wrap(p[i, 0] + v[i, 0] * t - paths[j, t, 0], W)
+                dy = _wrap(p[i, 1] + v[i, 1] * t - paths[j, t, 1], H)
+                c = np.hypot(dx, dy) - (r[i] + SHIP_RADIUS + MARGIN)
+                if c < clear[j]:
+                    clear[j] = c
+                if c < 0 and t_hit[j] == n_t:
+                    t_hit[j] = t
+    return t_hit, clear
 
 
 def first_hits(paths, threats):
     """first_hit() for k ship paths (k, T, 2) at once: (t_hit, clearance) arrays (k,)."""
-    k, n_t = paths.shape[:2]
-    if len(threats[2]) == 0:
-        return np.full(k, n_t), np.full(k, np.inf)
-    c = clearances(paths, threats)
-    hit = (c < 0).any(axis=0)                                     # (k, T)
-    return np.where(hit.any(axis=1), np.argmax(hit, axis=1), n_t), c.min(axis=(0, 2))
+    return _first_hits(paths, *threats)
 
 
 def first_hit(path, threats):
@@ -282,31 +303,71 @@ def first_hit(path, threats):
 
     threats: (p, v, r) numpy arrays of shape (n,2), (n,2), (n,).
     """
-    t_hit, clearance = first_hits(path[None], threats)
+    t_hit, clearance = _first_hits(path[None], *threats)
     return int(t_hit[0]), float(clearance[0])
+
+
+@njit(cache=True)
+def _coast_hits(path, p, v, r):
+    n_t = path.shape[0]
+    times = np.full(len(r), n_t)
+    clear = np.inf
+    for i in range(len(r)):
+        for t in range(n_t):
+            dx = _wrap(p[i, 0] + v[i, 0] * t - path[t, 0], W)
+            dy = _wrap(p[i, 1] + v[i, 1] * t - path[t, 1], H)
+            c = np.hypot(dx, dy) - (r[i] + SHIP_RADIUS + MARGIN)
+            if c < clear:
+                clear = c
+            if c < 0 and times[i] == n_t:
+                times[i] = t
+    return times, clear
 
 
 def coast_hits(path, threats):
     """first_hit() plus each threat's first colliding frame (len(path) if none) for
-    one ship path, from a single clearance computation."""
+    one ship path, from a single pass."""
     if len(threats[2]) == 0:
         return (len(path), float("inf")), np.empty(0)
-    c = clearances(path[None], threats)[:, 0]                     # (n, T)
-    hit = c < 0
-    times = np.where(hit.any(axis=1), np.argmax(hit, axis=1), len(path))
-    return (int(times.min()), float(c.min())), times
+    times, clear = _coast_hits(path, *threats)
+    return (int(times.min()), float(clear)), times
+
+
+@njit(cache=True)
+def _rom_first_hits(paths, p, v, reach):
+    k, n_t = paths.shape[0], paths.shape[1]
+    t_hit = np.full(k, n_t)
+    for j in range(k):
+        for t in range(n_t):
+            hit = False
+            for i in range(len(reach)):
+                dx = _wrap(p[i, 0] + v[i, 0] * t - paths[j, t, 0], W)
+                dy = _wrap(p[i, 1] + v[i, 1] * t - paths[j, t, 1], H)
+                if _octagon(dx, dy, reach[i]):
+                    hit = True
+                    break
+            if hit:
+                t_hit[j] = t
+                break
+    return t_hit
 
 
 def rom_first_hits(paths, p, v, reach):
     """First frame the game's own collision test would fire for each of k ship
     paths (k, T, 2), or T. p, v: (n,2) threat positions and velocities; reach: (n,)
     ROM_REACH plus padding."""
-    k, n_t = paths.shape[:2]
-    if len(reach) == 0:
-        return np.full(k, n_t)
-    dx, dy = path_offsets(paths, p, v)
-    hit = octagon_hit(dx, dy, reach[:, None, None]).any(axis=0)   # (k, T)
-    return np.where(hit.any(axis=1), np.argmax(hit, axis=1), n_t)
+    return _rom_first_hits(paths, p, v, reach)
+
+
+@njit(cache=True)
+def _covered(tx, ty, tvx, tvy, a, bp, bv, left):
+    for b in range(len(left)):
+        for t in range(left[b] + 1):
+            dx = _wrap(tx - bp[b, 0] + (tvx - bv[b, 0]) * t, W)
+            dy = _wrap(ty - bp[b, 1] + (tvy - bv[b, 1]) * t, H)
+            if _octagon(dx, dy, a):
+                return True
+    return False
 
 
 def covered(target, bullets, counter):
@@ -317,15 +378,38 @@ def covered(target, bullets, counter):
     """
     if not bullets:
         return False
-    tx, ty = target.pos
-    a = ROM_SHOT_REACH[target.kind]
-    left = np.array([frames_left(max(b.status, 1), counter) for b in bullets])
+    left = np.array([frames_left(max(b.status, 1), counter) for b in bullets], np.int64)
     bp = np.array([b.pos for b in bullets], float)
     bv = np.array([b.ram_v for b in bullets], float)
-    t = np.arange(left.max() + 1)[None, :]
-    dx = wrap_arr((tx - bp[:, 0:1]) + (target.vx - bv[:, 0:1]) * t, W)
-    dy = wrap_arr((ty - bp[:, 1:2]) + (target.vy - bv[:, 1:2]) * t, H)
-    return bool((octagon_hit(dx, dy, a) & (t <= left[:, None])).any())
+    return _covered(float(target.pos[0]), float(target.pos[1]), float(target.vx),
+                    float(target.vy), float(ROM_SHOT_REACH[target.kind]), bp, bv, left)
+
+
+@njit(cache=True)
+def _shot_kernel(p, v, a, posx, posy, svx, svy, hs, delay, counter):
+    """Kernel of Pilot._shot_hits; a is each target's reach already scaled by frac."""
+    m, nk = len(a), len(hs)
+    hit = np.zeros((m, nk), np.bool_)
+    first = np.zeros((m, nk), np.int64)
+    for j in range(nk):
+        relx, rely = BULLET_REL[hs[j], 0], BULLET_REL[hs[j], 1]
+        bvx = min(max(svx + relx, -BULLET_V_MAX), BULLET_V_MAX)
+        bvy = min(max(svy + rely, -BULLET_V_MAX), BULLET_V_MAX)
+        offx = np.floor(relx / 2) + relx  # spawn offset
+        offy = np.floor(rely / 2) + rely
+        dl = delay[j]
+        life = bullet_life(counter + dl)
+        for i in range(m):
+            # target - bullet at frame t of the bullet's flight (t = 0: it appears)
+            d0x = p[i, 0] - posx - offx - bvx + v[i, 0] * dl - svx * (dl - 1)
+            d0y = p[i, 1] - posy - offy - bvy + v[i, 1] * dl - svy * (dl - 1)
+            rvx, rvy = v[i, 0] - bvx, v[i, 1] - bvy
+            for t in range(life):
+                if _octagon(_wrap(d0x + rvx * t, W), _wrap(d0y + rvy * t, H), a[i]):
+                    hit[i, j] = True
+                    first[i, j] = t
+                    break
+    return hit, first
 
 
 def bcd(b):
@@ -745,26 +829,13 @@ class Pilot:
         (hit, first): boolean (targets, ks) and the frame of flight at which each shot
         first comes within frac of the game's hit reach for the target.
         """
-        counter = self.ship_sim[1]
-        hs = (heading + TURN_RATE * ks) % 256
-        rel = BULLET_REL[hs.astype(int)]                                   # (nk, 2)
-        sv = np.asarray(vel, float)
-        bvel = np.clip(sv + rel, -BULLET_V_MAX, BULLET_V_MAX)               # (nk, 2)
-        off = np.floor(rel / 2) + rel                                      # spawn offset
-        delay = np.abs(ks) + FIRE_DELAY                                     # (nk,)
-        p = np.array([t.pos for t in targets], float)[:, None, :]          # (m, 1, 2)
-        v = np.array([(t.vx, t.vy) for t in targets], float)[:, None, :]
-        # target - bullet at frame t of the bullet's flight (t = 0: it appears)
-        d0 = (p - np.asarray(pos, float) - off - bvel + v * delay[:, None]
-              - sv * (delay[:, None] - 1))                                  # (m, nk, 2)
-        rv = v - bvel[None]                                                 # (m, nk, 2)
-        life = bullet_life(counter + delay)                                 # (nk,)
-        t = np.arange(life.max(), dtype=float)[None, None, :]
-        dx = wrap_arr(d0[..., 0:1] + rv[..., 0:1] * t, W)                  # (m, nk, L)
-        dy = wrap_arr(d0[..., 1:2] + rv[..., 1:2] * t, H)
-        a = np.array([ROM_SHOT_REACH[tr.kind] for tr in targets], float)[:, None, None] * frac
-        inside = octagon_hit(dx, dy, a) & (t < life[None, :, None])
-        return inside.any(axis=2), np.argmax(inside, axis=2)
+        hs = ((heading + TURN_RATE * ks) % 256).astype(np.int64)
+        delay = (np.abs(ks) + FIRE_DELAY).astype(np.int64)
+        p = np.array([t.pos for t in targets], float)
+        v = np.array([(t.vx, t.vy) for t in targets], float)
+        a = np.array([ROM_SHOT_REACH[tr.kind] for tr in targets], float) * frac
+        return _shot_kernel(p, v, a, float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1]),
+                            hs, delay, int(self.ship_sim[1]))
 
     def _pick_target(self, objs, pos, vel, heading):
         """Highest-priority uncovered target that a shot can hit, choosing the
