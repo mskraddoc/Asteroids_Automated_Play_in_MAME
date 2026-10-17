@@ -127,6 +127,12 @@ def wrap(d, size):
     return (d + size / 2) % size - size / 2
 
 
+def wrap_arr(d, size):
+    """wrap() for numpy arrays, ~10x faster (float % is slow in numpy). Only the
+    sign at exactly +-size/2 can differ, which abs/hypot/octagon_hit ignore."""
+    return d - size * np.rint(d / size)
+
+
 def heading_vec(h):
     a = h * 2 * math.pi / 256
     return math.cos(a), math.sin(a)
@@ -151,6 +157,10 @@ def sin_rom(h):
 
 def cos_rom(h):
     return sin_rom(int(h) + 0x40)
+
+
+SIN256 = tuple(sin_rom(h) for h in range(256))
+COS256 = tuple(cos_rom(h) for h in range(256))
 
 
 def drag16(v):
@@ -180,15 +190,16 @@ def simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, pending
     the ship turns toward target_h, then thrusts for thrust_frames frames; target_h None
     coasts.
     """
+    # Hot loop: heading_diff, clamp16 and drag16 are inlined, sine/cosine come from
+    # the tables, and the path is built from lists at the end.
     x, y = pos
     vx, vy = vel16
     h = int(heading) % 256
-    path = np.empty((horizon + 1, 2))
-    path[0] = x, y
+    xs, ys = [x], [y]
     for t in range(1, horizon + 1):
         thrust = t == 1 and pending_thrust
         if t > 1 and target_h is not None:
-            d = heading_diff(target_h, h)
+            d = (target_h - h + 128) % 256 - 128
             if d > 1.5:
                 h = (h + TURN_RATE) % 256
             elif d < -1.5:
@@ -198,14 +209,22 @@ def simulate_ship(pos, vel16, heading, target_h, thrust_frames, counter, pending
                 thrust_frames -= 1
         if (counter + t) % 2 == 0:
             if thrust:
-                vx = clamp16(vx + 2 * cos_rom(h))
-                vy = clamp16(vy + 2 * sin_rom(h))
+                vx += 2 * COS256[h]
+                vy += 2 * SIN256[h]
+                vx = MAX_V16 if vx >= 0x4000 else -MAX_V16 if vx < -0x4000 else vx
+                vy = MAX_V16 if vy >= 0x4000 else -MAX_V16 if vy < -0x4000 else vy
             else:
-                vx, vy = drag16(vx), drag16(vy)
+                if vx:
+                    i = vx >> 8
+                    vx -= 2 * i + 1 if i >= 0 else 2 * i
+                if vy:
+                    i = vy >> 8
+                    vy -= 2 * i + 1 if i >= 0 else 2 * i
         x += vx >> 8
         y += vy >> 8
-        path[t] = x, y
-    return path
+        xs.append(x)
+        ys.append(y)
+    return np.column_stack((xs, ys)).astype(float)
 
 
 def octagon_hit(dx, dy, a):
@@ -219,6 +238,9 @@ def bullet_rel(h):
     return cos_rom(h) >> 1, sin_rom(h) >> 1
 
 
+BULLET_REL = np.array([bullet_rel(h) for h in range(256)], float)  # (256, 2)
+
+
 def bullet_life(counter):
     """Frames a shot that appears on a frame with this counter value stays in RAM."""
     return 68 + (4 - counter % 4) % 4
@@ -229,48 +251,62 @@ def frames_left(status, counter):
     return (4 - counter % 4) + 4 * (status - 1) - 1
 
 
+def path_offsets(paths, p, v):
+    """Wrapped threat-minus-ship offsets (dx, dy), each of shape (n, k, T), for k
+    ship paths (k, T, 2) against n threats moving from p at v ((n,2) arrays)."""
+    t = np.arange(paths.shape[1])
+    obj = p[:, None, :] + v[:, None, :] * t[None, :, None]       # (n, T, 2)
+    d = obj[:, None] - paths[None]                                # (n, k, T, 2)
+    return wrap_arr(d[..., 0], W), wrap_arr(d[..., 1], H)
+
+
+def clearances(paths, threats):
+    """Clearance (n, k, T) of n threats from k ship paths (k, T, 2); < 0 is a hit."""
+    p, v, r = threats
+    dx, dy = path_offsets(paths, p, v)
+    return np.hypot(dx, dy) - (r[:, None, None] + SHIP_RADIUS + MARGIN)
+
+
+def first_hits(paths, threats):
+    """first_hit() for k ship paths (k, T, 2) at once: (t_hit, clearance) arrays (k,)."""
+    k, n_t = paths.shape[:2]
+    if len(threats[2]) == 0:
+        return np.full(k, n_t), np.full(k, np.inf)
+    c = clearances(paths, threats)
+    hit = (c < 0).any(axis=0)                                     # (k, T)
+    return np.where(hit.any(axis=1), np.argmax(hit, axis=1), n_t), c.min(axis=(0, 2))
+
+
 def first_hit(path, threats):
     """(first colliding frame or len(path), smallest clearance) for a ship path.
 
     threats: (p, v, r) numpy arrays of shape (n,2), (n,2), (n,).
     """
-    p, v, r = threats
-    if len(r) == 0:
-        return len(path), float("inf")
-    t = np.arange(len(path))
-    obj = p[:, None, :] + v[:, None, :] * t[None, :, None]
-    d = obj - path[None, :, :]
-    d[..., 0] = wrap(d[..., 0], W)
-    d[..., 1] = wrap(d[..., 1], H)
-    clearance = np.hypot(d[..., 0], d[..., 1]) - (r[:, None] + SHIP_RADIUS + MARGIN)
-    hit = (clearance < 0).any(axis=0)
-    t_hit = int(np.argmax(hit)) if hit.any() else len(path)
-    return t_hit, float(clearance.min())
+    t_hit, clearance = first_hits(path[None], threats)
+    return int(t_hit[0]), float(clearance[0])
 
 
-def rom_first_hit(path, p, v, reach):
-    """First frame the game's own collision test would fire for a ship path, or
-    len(path). p, v: (n,2) threat positions and velocities; reach: (n,) ROM_REACH
-    plus padding."""
+def coast_hits(path, threats):
+    """first_hit() plus each threat's first colliding frame (len(path) if none) for
+    one ship path, from a single clearance computation."""
+    if len(threats[2]) == 0:
+        return (len(path), float("inf")), np.empty(0)
+    c = clearances(path[None], threats)[:, 0]                     # (n, T)
+    hit = c < 0
+    times = np.where(hit.any(axis=1), np.argmax(hit, axis=1), len(path))
+    return (int(times.min()), float(c.min())), times
+
+
+def rom_first_hits(paths, p, v, reach):
+    """First frame the game's own collision test would fire for each of k ship
+    paths (k, T, 2), or T. p, v: (n,2) threat positions and velocities; reach: (n,)
+    ROM_REACH plus padding."""
+    k, n_t = paths.shape[:2]
     if len(reach) == 0:
-        return len(path)
-    t = np.arange(len(path))
-    d = p[:, None, :] + v[:, None, :] * t[None, :, None] - path[None, :, :]
-    hit = octagon_hit(wrap(d[..., 0], W), wrap(d[..., 1], H), reach[:, None]).any(axis=0)
-    return int(np.argmax(hit)) if hit.any() else len(path)
-
-
-def hit_times(path, threats):
-    """First colliding frame of each threat against a ship path (len(path) if none)."""
-    p, v, r = threats
-    if len(r) == 0:
-        return np.empty(0)
-    t = np.arange(len(path))
-    d = p[:, None, :] + v[:, None, :] * t[None, :, None] - path[None, :, :]
-    d[..., 0] = wrap(d[..., 0], W)
-    d[..., 1] = wrap(d[..., 1], H)
-    hit = np.hypot(d[..., 0], d[..., 1]) < (r[:, None] + SHIP_RADIUS + MARGIN)
-    return np.where(hit.any(axis=1), np.argmax(hit, axis=1), len(path))
+        return np.full(k, n_t)
+    dx, dy = path_offsets(paths, p, v)
+    hit = octagon_hit(dx, dy, reach[:, None, None]).any(axis=0)   # (k, T)
+    return np.where(hit.any(axis=1), np.argmax(hit, axis=1), n_t)
 
 
 def covered(target, bullets, counter):
@@ -279,16 +315,17 @@ def covered(target, bullets, counter):
     Bullets use the game's exact velocity bytes, remaining life and hit test.
     counter: the frame counter ($5C) now.
     """
+    if not bullets:
+        return False
     tx, ty = target.pos
     a = ROM_SHOT_REACH[target.kind]
-    for b in bullets:
-        t = np.arange(frames_left(max(b.status, 1), counter) + 1)
-        bx, by = b.pos
-        dx = wrap((tx - bx) + (target.vx - b.ram_v[0]) * t, W)
-        dy = wrap((ty - by) + (target.vy - b.ram_v[1]) * t, H)
-        if octagon_hit(dx, dy, a).any():
-            return True
-    return False
+    left = np.array([frames_left(max(b.status, 1), counter) for b in bullets])
+    bp = np.array([b.pos for b in bullets], float)
+    bv = np.array([b.ram_v for b in bullets], float)
+    t = np.arange(left.max() + 1)[None, :]
+    dx = wrap_arr((tx - bp[:, 0:1]) + (target.vx - bv[:, 0:1]) * t, W)
+    dy = wrap_arr((ty - bp[:, 1:2]) + (target.vy - bv[:, 1:2]) * t, H)
+    return bool((octagon_hit(dx, dy, a) & (t <= left[:, None])).any())
 
 
 def bcd(b):
@@ -310,6 +347,7 @@ class Pilot:
         self.restart_t = None
         self.lives = None
         self.pending_shots = {}   # spawn frame -> (heading, predicted pos, predicted vel)
+        self._covered = {}        # covered() per track uid, rebuilt each frame
         self.steering = False     # hysteresis for _steer
         # saucer kills this level (shadow)
         self.level = None
@@ -403,14 +441,14 @@ class Pilot:
 
         # 1-2. Threat check, evasion plan, and defensive fire: shoot the rock or
         # saucer about to hit us when a shot can land in time.
+        self._covered = {}  # covered() per track uid, this frame
         coast_path = self._sim(pos, heading, None, 0)
-        coast = first_hit(coast_path, tarr)
+        coast, times = coast_hits(coast_path, tarr)
         evade = defend = None
-        times = hit_times(coast_path, tarr)
         if any(t_hit < DANGER_T[t.kind] for t_hit, t in zip(times, threats)):
             reach = np.array([ROM_REACH[t.kind] + HYPER_PAD for t in threats], float)
-            evade = self._plan_evade(pos, ship_vel, heading, tarr, coast, reach)
-            defend = self._plan_defend(threats, tarr, coast_path, objs, pos, ship_vel, heading)
+            evade = self._plan_evade(pos, heading, tarr, coast, coast_path, reach)
+            defend = self._plan_defend(threats, times, objs, pos, ship_vel, heading)
             if evade == "H" and defend is None:
                 inputs.add("H")
 
@@ -447,7 +485,7 @@ class Pilot:
         if defend is not None:
             shoot = defend["k"] == 0 and not defend["covered"]  # survival first, even the pet
         else:
-            shoot = (self._hits_now(targets, pos, ship_vel, heading, plan)
+            shoot = (plan is not None and plan["now"]
                      and not (pet is not None and self._would_hit(pet, pos, ship_vel, heading)))
         if not self.fired_last and n_bullets < MAX_BULLETS and shoot:
             inputs.add("F")
@@ -630,19 +668,26 @@ class Pilot:
         hit, _ = self._shot_hits([track], pos, vel, heading, np.array([0]), PET_VETO_FRAC)
         return bool(hit.any())
 
-    def _plan_defend(self, threats, tarr, coast_path, objs, pos, vel, heading):
+    def _is_covered(self, target, bullets):
+        """covered() for this frame, computed once per track."""
+        c = self._covered.get(target.uid)
+        if c is None:
+            c = self._covered[target.uid] = covered(target, bullets, self.ship_sim[1])
+        return c
+
+    def _plan_defend(self, threats, times, objs, pos, vel, heading):
         """Shoot the threat that will hit first, if it is a rock or saucer and a shot
         (after turning k steps) lands DEFEND_MARGIN frames before the predicted hit.
+        times: each threat's first colliding frame while coasting (coast_hits).
         Returns {"track", "k", "covered"} or None; covered means a bullet already in
         flight will hit it, so just hold."""
-        times = hit_times(coast_path, tarr)
         if len(times) == 0:
             return None
         i = int(np.argmin(times))
         t_hit, threat = int(times[i]), threats[i]
         if threat.kind not in DEFEND_KINDS:
             return None
-        if covered(threat, [t for t in objs if t.kind == "B"], self.ship_sim[1]):
+        if self._is_covered(threat, [t for t in objs if t.kind == "B"]):
             return {"track": threat, "k": 0, "covered": True}
         ks = np.arange(-MAX_TURN, MAX_TURN + 1)
         hit, first = self._shot_hits([threat], pos, vel, heading, ks)
@@ -653,19 +698,19 @@ class Pilot:
         j = int(np.argmin(np.where(ok, land, np.inf)))
         return {"track": threat, "k": int(ks[j]), "covered": False}
 
-    def _plan_evade(self, pos, vel, heading, tarr, coast, reach):
+    def _plan_evade(self, pos, heading, tarr, coast, coast_path, reach):
         """Best escape heading (float), "H" for hyperspace, or None to coast.
 
-        coast: first_hit() score of drifting without thrust; reach: each threat's
-        ROM_REACH plus HYPER_PAD, for the check before a jump.
+        coast, coast_path: first_hit() score and path of drifting without thrust;
+        reach: each threat's ROM_REACH plus HYPER_PAD, for the check before a jump.
         """
         best_h, best_score = None, coast
         prev_score = None
-        paths = {}
-        for k in range(EVADE_HEADINGS):
-            h = k * 256 / EVADE_HEADINGS
-            paths[h] = self._sim(pos, heading, h, EVADE_THRUST)
-            score = first_hit(paths[h], tarr)
+        hs = [k * 256 / EVADE_HEADINGS for k in range(EVADE_HEADINGS)]
+        paths = np.stack([self._sim(pos, heading, h, EVADE_THRUST) for h in hs])
+        t_hits, clears = first_hits(paths, tarr)
+        for h, t_hit, clear in zip(hs, t_hits, clears):
+            score = int(t_hit), float(clear)
             if self.evade_h is not None and h == self.evade_h:
                 prev_score = score
             if score > best_score:
@@ -678,8 +723,8 @@ class Pilot:
             # Jump only if the game's own collision test agrees nothing escapes;
             # otherwise take the option that it says clears longest.
             p, v, _ = tarr
-            options = [(rom_first_hit(self._sim(pos, heading, None, 0), p, v, reach), None)]
-            options += [(rom_first_hit(path, p, v, reach), h) for h, path in paths.items()]
+            ts = rom_first_hits(np.concatenate((coast_path[None], paths)), p, v, reach)
+            options = list(zip(ts.tolist(), [None] + hs))
             t_best, h_best = max(options, key=lambda o: o[0])
             if t_best <= HYPER_T:
                 return "H"
@@ -702,7 +747,7 @@ class Pilot:
         """
         counter = self.ship_sim[1]
         hs = (heading + TURN_RATE * ks) % 256
-        rel = np.array([bullet_rel(h) for h in hs], float)                 # (nk, 2)
+        rel = BULLET_REL[hs.astype(int)]                                   # (nk, 2)
         sv = np.asarray(vel, float)
         bvel = np.clip(sv + rel, -BULLET_V_MAX, BULLET_V_MAX)               # (nk, 2)
         off = np.floor(rel / 2) + rel                                      # spawn offset
@@ -713,21 +758,23 @@ class Pilot:
         d0 = (p - np.asarray(pos, float) - off - bvel + v * delay[:, None]
               - sv * (delay[:, None] - 1))                                  # (m, nk, 2)
         rv = v - bvel[None]                                                 # (m, nk, 2)
-        life = np.array([bullet_life(counter + d) for d in delay])         # (nk,)
+        life = bullet_life(counter + delay)                                 # (nk,)
         t = np.arange(life.max(), dtype=float)[None, None, :]
-        dx = wrap(d0[..., 0:1] + rv[..., 0:1] * t, W)                      # (m, nk, L)
-        dy = wrap(d0[..., 1:2] + rv[..., 1:2] * t, H)
+        dx = wrap_arr(d0[..., 0:1] + rv[..., 0:1] * t, W)                  # (m, nk, L)
+        dy = wrap_arr(d0[..., 1:2] + rv[..., 1:2] * t, H)
         a = np.array([ROM_SHOT_REACH[tr.kind] for tr in targets], float)[:, None, None] * frac
         inside = octagon_hit(dx, dy, a) & (t < life[None, :, None])
         return inside.any(axis=2), np.argmax(inside, axis=2)
 
     def _pick_target(self, objs, pos, vel, heading):
         """Highest-priority uncovered target that a shot can hit, choosing the
-        heading step that hits soonest. Returns a plan dict or None."""
+        heading step that hits soonest. Returns a plan dict or None; its "now" says
+        whether a shot from the current heading (k = 0) would hit a target of that
+        class (higher classes have no hit at any k, so none at k = 0 either)."""
         bullets = [t for t in objs if t.kind == "B"]
         ks = np.arange(-MAX_TURN, MAX_TURN + 1)
         for ci, kinds in enumerate(PRIORITY):
-            cands = [t for t in objs if t.kind in kinds and not covered(t, bullets, self.ship_sim[1])]
+            cands = [t for t in objs if t.kind in kinds and not self._is_covered(t, bullets)]
             if not cands:
                 continue
             hit, first = self._shot_hits(cands, pos, vel, heading, ks)
@@ -742,22 +789,10 @@ class Pilot:
             n = abs(k) + FIRE_DELAY + int(first[i, j])
             aim = (int(t.pos[0] + t.vx * n) % W, int(t.pos[1] + t.vy * n) % H)
             self.target_uid = t.uid
-            return {"track": t, "k": k, "aim": aim, "class": ci}
+            return {"track": t, "k": k, "aim": aim, "class": ci,
+                    "now": bool(hit[:, MAX_TURN].any())}
         self.target_uid = None
         return None
-
-    def _hits_now(self, objs, pos, vel, heading, plan):
-        """Would a shot from the current heading hit a target of the planned
-        priority class or higher?"""
-        if plan is None:
-            return False
-        kinds = "".join("".join(k) for k in PRIORITY[:plan["class"] + 1])
-        bullets = [t for t in objs if t.kind == "B"]
-        targets = [t for t in objs if t.kind in kinds and not covered(t, bullets, self.ship_sim[1])]
-        if not targets:
-            return False
-        hit, _ = self._shot_hits(targets, pos, vel, heading, np.array([0]))
-        return bool(hit.any())
 
     def _expect_spawn(self, frame, pos, vel, heading):
         """Remember where this shot's bullet should appear, to check the model."""
