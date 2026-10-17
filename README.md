@@ -2,9 +2,11 @@
 
 This project contains Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 
-A Lua script running in MAME sends game data to a local Python server via a socket. The server decodes the game data and decides which controls to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the highest-priority target and fire. The Python server sends MAME keypresses back to the MAME Lua script to control gameplay and information overlays showing what the AI sees can be toggled.
+A Lua script running in MAME sends real-time game data to a local Python server via a socket. The server decodes the game data and decides which controls to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the highest-priority target and fire. The Python server sends keypresses back to the Lua script to control gameplay. Information overlays showing what the AI sees can be toggled on and off.
 
-If unchecked, the autopilot bot will earn 100K - 200K points per ship death. The Server will take steps to keep the number of extra ships at or below 25, deliberately losing any extra by ramming into a rock. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog resets the machine (around 1.7 million points). Killing off ships when the reserve ship total is greater than 25 maintains gameplay speed.
+Left unchecked, the autopilot will earn hundreds of thousands of points per ship lost. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog timer (emulated by MAME) resets the machine, at around 1.7 million points. Losing ships when the reserve total is high keeps the game running at full speed, so the server keeps the number of extra ships at or below 25, deliberately losing any beyond that by ramming into a rock.
+
+The score overlay breaks down how each ship was lost: failed hyperspace jumps, collisions with rocks or saucers, saucer shots, and "kamikaze" deaths. Kamikaze deaths are the ships the AI lost on purpose.
 
 ## Tested with
 
@@ -16,17 +18,17 @@ It seems likely to work with other MAME versions, Asteroids ROM revisions, opera
 
 ## Files
 
-| File            | Purpose                                                                                                |
-|-----------------|--------------------------------------------------------------------------------------------------------|
-| `ast_link.lua`  | MAME autoboot Lua script                                                                               |
-| `ast_server.py` | Python server. Handles local socket communication, decodes and tracks objects, and calls the autopilot |
-| `ast_ai.py`     | The autopilot: threat check, evasion, target choice and aiming                                         |
-| `cfg/`          | MAME configuration for `asteroid`                                                                      |
+| File            | Purpose                                                                                                 |
+|-----------------|---------------------------------------------------------------------------------------------------------|
+| `ast_link.lua`  | MAME autoboot Lua script                                                                                |
+| `ast_server.py` | Python server. Handles local socket communication, decodes and tracks objects, and calls the autopilot  |
+| `ast_ai.py`     | The autopilot: threat check, evasion, target choice and aiming                                          |
+| `cfg/`          | MAME configuration for `asteroid`                                                                       |
 
 ## Requirements
 
 - Python 3 with `numpy` (`pip3 install numpy`)
-- Optional: `numba` (`pip3 install numba`). Depending on your development environment, numba can be installed to boost server speed. It compiles the autopilot's collision and aiming loops, making each frame's AI about 3x faster (the first run takes a second or two to compile, then it is cached). Without numba the server still runs, but much more slowly, and may fall below real-time speed. On Intel Macs, newer numba releases need LLVM built from source; `pip3 install --only-binary=:all: "numba<0.63"` installs a prebuilt version.
+- Optional: `numba` (`pip3 install numba`). Depending on your development environment, numba can be installed to boost server speed. It compiles the autopilot's collision and aiming loops, making each frame's AI about 3x faster.
 - A MAME build (tested with version 0.270)
 - Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`. You will have to find your own ROM set.
   **The ROMs are not included here.**
@@ -39,19 +41,19 @@ In a terminal window, start the Python server first:
 python3 ast_server.py
 ```
 
-In a second terminal, start MAME using:
+In a second terminal, start MAME:
 
 ```zsh
 mame asteroid -rompath ../roms -window -autoboot_script ../ast_link.lua
 ```
 
-Make sure to edit `-rompath ../roms` to match your configuration.
+Edit `-rompath ../roms` to match your configuration.
 
-The Python autopilot script inserts a coin, starts the game, and restarts it after a game ends.
+The Python autopilot inserts a coin, starts the game, and restarts it after each game ends.
 
-### Python Server (ast_server.py) options
+### Python server (`ast_server.py`) options
 
-In the arcade, each game of Asteroids would start from a random point. Since we are emulating Asteroids and running a bot, we see the same game played each time. To add variety, a pseudo-randomized starting point is generated by default. When a game starts, the server seeds Asteroids' random-number generator with a 15-bit value (32,768 possible starting points). The session seed is printed when the server starts, and each game's starting value is logged as `game N start: RNG 0x....`. To replay a session, use the command line option `--random <N>`.
+In the arcade, each game of Asteroids starts from a random point. Since we are emulating Asteroids and running a bot, we would see the same game played each time. To add variety, a pseudo-randomized starting point is generated by default: when a game starts, the server seeds Asteroids' random-number generator with a 16-bit value (65,535 possible starting points). The session seed is printed when the server starts, and each game's starting value is logged as `game N start: RNG 0x....`. To replay a session, use the command line option `--random <N>`.
 
 | Option         | Effect                                                               |
 |----------------|----------------------------------------------------------------------|
@@ -63,11 +65,11 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 
 `--style <name>` picks how the autopilot plays (`M` in MAME switches styles while running).
 
-| Style     | Behaviour                                                                                                         |
-|-----------|-------------------------------------------------------------------------------------------------------------------|
-| `classic` | Default. Aims at the highest-priority target and fires; returns to the middle between waves                       |
-| `flyer`   | Flies on a drifting throttle (none to full), only along predicted-safe paths; returns to the middle between waves |
-| `shadow`  | Spares one large rock per level and flies close to it until 2 saucers are killed                      |
+| Style     | Behaviour                                                                                                  |
+|-----------|------------------------------------------------------------------------------------------------------------|
+| `classic` | Default. Aims at the highest-priority target and fires; returns to the middle between waves. Most efficient |
+| `flyer`   | Prefers to fly around more, choosing predicted-safe paths; returns to the middle between waves             |
+| `shadow`  | Spares one large rock per level and flies close to it until 2 saucers are killed                           |
 
 ## Keys (in MAME)
 
@@ -79,16 +81,16 @@ In the arcade, each game of Asteroids would start from a random point. Since we 
 | `V`       | View projected object positions on/off                              |
 | `]` / `[` | Project further / less far ahead (5–300 frames, step 5)             |
 | `A`       | AI state text on/off                                                |
-| `S`       | Score overlay on/off. Displays actual score beyond 99,990 rollover. |
-| `.` / `,` | Faster / slower emulation (0.25x–8x, default 1x)                    |
+| `S`       | Score overlay on/off; shows the full score past the 99,990 rollover |
+| `.` / `,` | Faster / slower emulation (0.25x–8x, then MAX; default 1x)          |
 | `=` / `-` | MAME volume up / down (2 dB steps)                                  |
 | `M`       | Next play style (classic, flyer, shadow)                            |
 
 ## Object Detection Overlay Examples
 
-<img width="50%" alt="Screenshot 2026-10-11 at 11 18 47 AM" src="images/overlay-boxes.png" />
-<img width="50%" alt="Screenshot 2026-10-11 at 11 17 15 AM" src="images/overlay-object-list.png" />
-<img width="50%" alt="Screenshot 2026-10-11 at 11 15 01 AM" src="images/overlay-projection.png" />
+<img width="50%" alt="Overlay: boxes around each object and the aim line" src="images/overlay-boxes.png" />
+<img width="50%" alt="Overlay: object list" src="images/overlay-object-list.png" />
+<img width="50%" alt="Overlay: projected object positions" src="images/overlay-projection.png" />
 
 ## Video
 
