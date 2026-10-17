@@ -26,7 +26,7 @@ It seems likely to work with other MAME versions, Asteroids ROM revisions, opera
 ## Requirements
 
 - Python 3 with `numpy` (`pip3 install numpy`)
-- Optional: `numba` (`pip3 install numba`). Depending on your development environment, numba can be installed to boost server speed. It compiles the autopilot's collision and aiming loops, making each frame's AI about 3x faster (the first run takes a second or two to compile, then it is cached). Without numba the server uses numpy alone, which is still many times faster than real time. On Intel Macs, newer numba releases need LLVM built from source; `pip3 install --only-binary=:all: "numba<0.63"` installs a prebuilt version.
+- Optional: `numba` (`pip3 install numba`). Depending on your development environment, numba can be installed to boost server speed. It compiles the autopilot's collision and aiming loops, making each frame's AI about 3x faster (the first run takes a second or two to compile, then it is cached). Without numba the server still runs, but much more slowly, and may fall below real-time speed. On Intel Macs, newer numba releases need LLVM built from source; `pip3 install --only-binary=:all: "numba<0.63"` installs a prebuilt version.
 - A MAME build (tested with version 0.270)
 - Asteroids (rev 4) ROM set, `asteroid.zip`, in `roms/`. You will have to find your own ROM set.
   **The ROMs are not included here.**
