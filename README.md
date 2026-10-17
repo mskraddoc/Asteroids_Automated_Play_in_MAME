@@ -6,7 +6,7 @@ A Lua script running in MAME sends real-time game data to a local Python server 
 
 Left unchecked, the autopilot will earn hundreds of thousands of points per ship lost. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog timer (emulated by MAME) resets the machine, at around 1.7 million points. Losing ships when the reserve total is high keeps the game running at full speed, so the server keeps the number of extra ships at or below 25, deliberately losing any beyond that by ramming into a rock.
 
-The score overlay breaks down how each ship was lost: failed hyperspace jumps, collisions with rocks or saucers, saucer shots, and "kamikaze" deaths. Kamikaze deaths are the ships the AI lost on purpose.
+The score overlay breaks down how each ship was lost: failed hyperspace jumps, collisions with rocks or saucers, saucer shots, and "kamikaze" deaths. Kamikaze deaths are the ships the AI chose to lose on purpose.
 
 ## Tested with
 
