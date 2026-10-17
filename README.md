@@ -2,9 +2,9 @@
 
 This project contains Lua and Python scripts that enable automated play of Atari's *Asteroids* (1979) inside MAME.
 
-A Lua script running in MAME sends real-time game data to a local Python server via a socket. The server decodes the game data and decides which controls to press. Avoiding player ship collision is prioritized. Otherwise, the heuristics aim the player ship at the highest-priority target and fire. The Python server sends keypresses back to the Lua script to control gameplay. Information overlays showing what the AI sees can be toggled on and off.
+A Lua script running in MAME sends real-time game data to a local Python server via a socket. The server receives the game data and passes it off to a Python AI agent. The Python AI agent analyzes the game state and sends keypresses back to the Lua script to control gameplay. Information overlays showing what the AI sees can be toggled on and off.
 
-Left unchecked, the autopilot will earn hundreds of thousands of points per ship lost. Asteroids draws every reserve ship each frame, and with about 150 or more the game slows down until its watchdog timer (emulated by MAME) resets the machine, at around 1.7 million points. Losing ships when the reserve total is high keeps the game running at full speed, so the server keeps the number of extra ships at or below 25, deliberately losing any beyond that by ramming into a rock.
+Left unchecked, the autopilot will earn hundreds of thousands of points per ship lost. Asteroids draws the reserve ships each frame and, at about 150 reserve ships, the game slows down until a watchdog timer (emulated by MAME) resets the machine. Resetting the emulated machine under these conditions limits the achievable score to 1.7 million points. Losing ships when the reserve ship total is high keeps the game running at full speed. To maximize score, the autopilot chooses to keep the number of extra ships at or below 25, deliberately losing any ships beyond that number by ramming the current ship into a rock.
 
 The score overlay breaks down how each ship was lost: failed hyperspace jumps, collisions with rocks or saucers, saucer shots, and "kamikaze" deaths. Kamikaze deaths are the ships the AI chose to lose on purpose.
 
@@ -65,11 +65,11 @@ In the arcade, each game of Asteroids starts from a random point. Since we are e
 
 `--style <name>` picks how the autopilot plays (`M` in MAME switches styles while running).
 
-| Style     | Behaviour                                                                                                  |
-|-----------|------------------------------------------------------------------------------------------------------------|
+| Style     | Behavior                                                                                                    |
+|-----------|-------------------------------------------------------------------------------------------------------------|
 | `classic` | Default. Aims at the highest-priority target and fires; returns to the middle between waves. Most efficient |
-| `flyer`   | Prefers to fly around more, choosing predicted-safe paths; returns to the middle between waves             |
-| `shadow`  | Spares one large rock per level and flies close to it until 2 saucers are killed                           |
+| `flyer`   | Prefers to fly around more, choosing predicted-safe paths; returns to the middle between waves              |
+| `shadow`  | Spares one large rock per level and flies close to it until 2 saucers are killed                            |
 
 ## Keys (in MAME)
 
