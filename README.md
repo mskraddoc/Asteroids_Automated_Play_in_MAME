@@ -94,10 +94,8 @@ In the arcade, each game of Asteroids starts from a random point. Since we are e
 
 ## Video
 
-<a href="https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4"><img width="50%" alt="One Hour of Automated Gameplay: autopilot in EVADE mode at 57,280 points" src="images/gameplay-video.png"></a>
-
+<a href="https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4"><img width="50%" alt="One Hour of Automated Gameplay: autopilot in EVADE mode at 57,280 points" src="images/gameplay-video.png"></a><br>
 [One Hour of Automated Gameplay](https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4)
 
-<a href="https://youtu.be/zNzcSkk0HAY"><img width="50%" alt="High Score Run 11 Hours 59 minutes: 51,445,300 points at level 5936" src="images/ast_highscore_screen_cap.png"></a>
-
+<a href="https://youtu.be/zNzcSkk0HAY"><img width="50%" alt="High Score Run 11 Hours 59 minutes: 51,445,300 points at level 5936" src="images/ast_highscore_screen_cap.png"></a><br>
 [High Score Run 11 Hours 59 minutes](https://youtu.be/zNzcSkk0HAY)
