@@ -97,3 +97,7 @@ In the arcade, each game of Asteroids starts from a random point. Since we are e
 <a href="https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4"><img width="50%" alt="One Hour of Automated Gameplay: autopilot in EVADE mode at 57,280 points" src="images/gameplay-video.png"></a>
 
 [One Hour of Automated Gameplay](https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4)
+
+### Highscore
+This run was stopped to stay under the current YouTube upload limit of 12 hours.
+[11 hours 59 minutes of Automated Gameplay](https://www.youtube.com/watch?v=i0fGM7LTBwo)
