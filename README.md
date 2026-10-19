@@ -100,4 +100,7 @@ In the arcade, each game of Asteroids starts from a random point. Since we are e
 
 ### Highscore
 This run was stopped to stay under the current YouTube upload limit of 12 hours.
+
+<a href="[https://youtu.be/11Aerj8sB8E?si=0yZIJSVTaihNBKK4](https://www.youtube.com/watch?v=i0fGM7LTBwo)"><img width="50%" alt="11 hours 59 minutes of gameplay." src="[images/gameplay-video.png](https://github.com/user-attachments/assets/9a1547dd-40a2-45b5-99bd-63c56112dec4)"></a>
+
 [11 hours 59 minutes of Automated Gameplay](https://www.youtube.com/watch?v=i0fGM7LTBwo)
